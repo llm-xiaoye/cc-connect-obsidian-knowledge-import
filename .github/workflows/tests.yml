@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile scripts
+        run: python -m py_compile scripts/manage.py skill/obsidian-knowledge-import/scripts/ki_import.py
+      - name: Run tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v

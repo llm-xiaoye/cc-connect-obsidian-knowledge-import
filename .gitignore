@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local credentials and user-specific configuration must never be published.
+config.toml
+!examples/config.toml
+.env
+.env.*
+!.env.example
+ki-config.json
+*.token
+*.secret
