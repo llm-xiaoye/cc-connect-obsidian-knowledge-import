@@ -181,6 +181,82 @@ def fixture_server(routes):
 
 
 class PlanTests(unittest.TestCase):
+    def test_init_allocates_distinct_private_artifact_directories(self):
+        args = type("Args", (), {})()
+        with mock.patch.object(ki, "emit") as emit:
+            ki.command_init(args)
+            first = emit.call_args.args[0]
+            ki.command_init(args)
+            second = emit.call_args.args[0]
+        self.assertNotEqual(first["run_dir"], second["run_dir"])
+        for payload in (first, second):
+            root = Path(payload["run_dir"])
+            self.addCleanup(lambda p=root: __import__("shutil").rmtree(p, ignore_errors=True))
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+            self.assertFalse(Path(payload["artifacts"]["raw_file"]).exists())
+
+    def test_bound_plan_rejects_cross_run_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            run_a = base / "ki-run-a"
+            run_b = base / "ki-run-b"
+            run_a.mkdir()
+            run_b.mkdir()
+            artifacts_a = ki.run_artifacts(run_a)
+            artifacts_b = ki.run_artifacts(run_b)
+            write_json(Path(artifacts_a["plan_file"]), {
+                **base_plan("https://example.com/a"),
+                "run_id": "ki-run-a",
+                "run_dir": str(run_a),
+                "artifacts": artifacts_a,
+            })
+            with self.assertRaisesRegex(ki.KiError, "独立运行目录"):
+                ki.read_bound_plan(
+                    artifacts_a["plan_file"],
+                    output=artifacts_b["lookup_file"],
+                    output_key="lookup_file",
+                )
+
+    def test_lookup_and_fetch_preserve_run_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run = root / "ki-run-test"
+            run.mkdir()
+            artifacts = ki.run_artifacts(run)
+            plan = {
+                **base_plan("https://example.com/a"),
+                "run_id": run.name,
+                "run_dir": str(run),
+                "artifacts": artifacts,
+            }
+            write_json(Path(artifacts["plan_file"]), plan)
+            vault = make_vault(root)
+            lookup_args = type("Args", (), {
+                "plan_file": artifacts["plan_file"],
+                "vault": str(vault),
+                "output": artifacts["lookup_file"],
+            })()
+            ki.command_lookup(lookup_args)
+            lookup = json.loads(Path(artifacts["lookup_file"]).read_text(encoding="utf-8"))
+            self.assertEqual(lookup["run_id"], run.name)
+            self.assertEqual(lookup["artifacts"], artifacts)
+
+            fetch_args = type("Args", (), {
+                "plan_file": artifacts["plan_file"],
+                "timeout": 1,
+                "jina_base": "https://r.jina.ai",
+                "output": artifacts["article_file"],
+            })()
+            with mock.patch.object(ki, "fetch_article", return_value={
+                "status": "ok",
+                "source_url": "https://example.com/a",
+                "article_text": "正文" * 100,
+            }):
+                ki.command_fetch(fetch_args)
+            article = json.loads(Path(artifacts["article_file"]).read_text(encoding="utf-8"))
+            self.assertEqual(article["run_id"], run.name)
+            self.assertEqual(article["artifacts"], artifacts)
+
     def test_single_and_batch_preserve_order_and_deduplicate(self):
         single = ki.plan_from_raw("  --single https://example.com/a?x=1#f  ")
         self.assertEqual(single["mode"], "single")
@@ -672,6 +748,39 @@ class CommitTests(unittest.TestCase):
         index = (self.vault / "_knowledge-index.md").read_text(encoding="utf-8")
         self.assertIn("| [已有笔记](AI/Agent/existing.md) | 观点 |", index)
         self.assertIn("| 2026-01-02 |", index)
+
+    def test_append_moves_existing_index_row_to_top_without_duplicate(self):
+        target = self.vault / "AI/Agent/existing.md"
+        target.write_text(
+            "---\n"
+            'title: "已有笔记"\n'
+            'sources:\n  - "https://old.example/source"\n'
+            "date: 2026-01-02\n"
+            "created: 2026-01-03\n"
+            "updated: 2026-01-03\n"
+            "tags: [agent, workflow]\n"
+            "type: 观点\n"
+            "---\n\n## 摘要\n\n原正文。\n",
+            encoding="utf-8",
+        )
+        index_path = self.vault / "_knowledge-index.md"
+        index = index_path.read_text(encoding="utf-8")
+        index += (
+            "| [已有笔记](AI/Agent/existing.md) | 观点 | `agent` | 旧洞察 | 2026-01-02 |\n"
+        )
+        index_path.write_text(index, encoding="utf-8")
+        analysis = new_analysis(path="AI/Agent/existing.md")
+        analysis.update({"action": "append", "tags": ["agent", "memory", "实践案例"]})
+        write_json(self.analysis, analysis)
+        self.body.write_text(append_body(), encoding="utf-8")
+
+        result = self.run_commit()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = index_path.read_text(encoding="utf-8")
+        row = "[已有笔记](AI/Agent/existing.md)"
+        self.assertEqual(updated.count(row), 1)
+        self.assertLess(updated.index(row), updated.index("[旧文章](AI/Agent/old.md)"))
 
     def test_failure_after_each_replace_rolls_back_all_files(self):
         before = {p.relative_to(self.vault): p.read_bytes() for p in self.vault.rglob("*") if p.is_file()}

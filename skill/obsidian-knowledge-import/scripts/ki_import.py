@@ -80,6 +80,46 @@ class KiError(Exception):
     """A user-facing deterministic workflow error."""
 
 
+RUN_ARTIFACT_NAMES = {
+    "raw_file": "raw.txt",
+    "plan_file": "plan.json",
+    "schedule_file": "schedule.json",
+    "lookup_file": "lookup.json",
+    "article_file": "article.json",
+    "terms_file": "terms.txt",
+    "scan_file": "scan.json",
+    "body_file": "body.md",
+    "analysis_file": "analysis.json",
+    "commit_dry_file": "commit-dry.json",
+    "commit_file": "commit.json",
+}
+
+
+def run_artifacts(run_dir: Path) -> Dict[str, str]:
+    return {
+        key: str((run_dir / filename).resolve())
+        for key, filename in RUN_ARTIFACT_NAMES.items()
+    }
+
+
+def command_init(args: argparse.Namespace) -> None:
+    run_dir = Path(tempfile.mkdtemp(prefix="ki-run-")).resolve()
+    run_dir.chmod(0o700)
+    artifacts = run_artifacts(run_dir)
+    marker = {
+        "schema": 1,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "artifacts": artifacts,
+    }
+    atomic_write(
+        run_dir / ".ki-run.json",
+        json.dumps(marker, ensure_ascii=False, indent=2) + "\n",
+        0o600,
+    )
+    emit({"status": "ok", **marker})
+
+
 def emit(payload: Dict[str, Any], output: Optional[str] = None) -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     if output:
@@ -241,12 +281,73 @@ def plan_from_raw(raw: str) -> Dict[str, Any]:
 
 
 def command_plan(args: argparse.Namespace) -> None:
-    raw = Path(args.input_file).read_text(encoding="utf-8")
-    emit(plan_from_raw(raw), args.output)
+    input_path = Path(args.input_file).expanduser().resolve()
+    raw = input_path.read_text(encoding="utf-8")
+    result = plan_from_raw(raw)
+    marker_path = input_path.parent / ".ki-run.json"
+    if marker_path.is_file():
+        marker = read_json(str(marker_path))
+        artifacts = marker.get("artifacts")
+        if not isinstance(artifacts, dict):
+            raise KiError("运行目录清单无效")
+        expected_raw = Path(str(artifacts.get("raw_file", ""))).resolve()
+        expected_plan = Path(str(artifacts.get("plan_file", ""))).resolve()
+        if input_path != expected_raw or not args.output:
+            raise KiError("运行文件未使用 init 分配的独立路径")
+        if Path(args.output).expanduser().resolve() != expected_plan:
+            raise KiError("plan 输出未使用 init 分配的独立路径")
+        result.update({
+            "run_id": marker.get("run_id"),
+            "run_dir": marker.get("run_dir"),
+            "artifacts": artifacts,
+        })
+    emit(result, args.output)
+
+
+def read_bound_plan(
+    plan_file: str,
+    *,
+    output: Optional[str] = None,
+    output_key: Optional[str] = None,
+    inputs: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    plan_path = Path(plan_file).expanduser().resolve()
+    plan = read_json(str(plan_path))
+    artifacts = plan.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return plan
+    expected_plan = Path(str(artifacts.get("plan_file", ""))).resolve()
+    if plan_path != expected_plan:
+        raise KiError("plan 文件与本次独立运行目录不一致")
+    if output_key:
+        if not output:
+            raise KiError(f"{output_key} 必须写入本次独立运行目录")
+        expected_output = Path(str(artifacts.get(output_key, ""))).resolve()
+        if Path(output).expanduser().resolve() != expected_output:
+            raise KiError(f"{output_key} 与本次独立运行目录不一致")
+    for artifact_key, raw_path in (inputs or {}).items():
+        expected_input = Path(str(artifacts.get(artifact_key, ""))).resolve()
+        if Path(raw_path).expanduser().resolve() != expected_input:
+            raise KiError(f"{artifact_key} 与本次独立运行目录不一致")
+    return plan
+
+
+def attach_run_context(plan: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(plan.get("artifacts"), dict):
+        payload.update({
+            "run_id": plan.get("run_id"),
+            "run_dir": plan.get("run_dir"),
+            "artifacts": plan.get("artifacts"),
+        })
+    return payload
 
 
 def command_schedule(args: argparse.Namespace) -> None:
-    plan = read_json(args.plan_file)
+    plan = read_bound_plan(
+        args.plan_file,
+        output=args.output,
+        output_key="schedule_file",
+    )
     if plan.get("status") != "ok" or plan.get("mode") != "batch":
         raise KiError("schedule 只接受成功的批量 plan")
     urls = plan.get("input_urls")
@@ -375,7 +476,11 @@ def find_log_url(log_path: Path, url: str) -> Optional[str]:
 
 
 def command_lookup(args: argparse.Namespace) -> None:
-    plan = read_json(args.plan_file)
+    plan = read_bound_plan(
+        args.plan_file,
+        output=args.output,
+        output_key="lookup_file",
+    )
     if plan.get("status") != "ok" or plan.get("mode") != "single":
         raise KiError("lookup 只接受成功的单条 plan")
     url = str(plan.get("current_url", ""))
@@ -384,14 +489,14 @@ def command_lookup(args: argparse.Namespace) -> None:
         recovered = recover_journal(vault)
         found = find_log_url(vault / "_import-log.md", url)
     if found is None:
-        emit({
+        emit(attach_run_context(plan, {
             "status": "ok",
             "duplicate": False,
             "current_url": url,
             "recovered_previous_transaction": recovered,
-        }, args.output)
+        }), args.output)
     elif plan.get("force") is True:
-        emit({
+        emit(attach_run_context(plan, {
             "status": "ok",
             "duplicate": True,
             "bypass": True,
@@ -399,16 +504,16 @@ def command_lookup(args: argparse.Namespace) -> None:
             "path": found,
             "recovered_previous_transaction": recovered,
             "message": f"已确认更新：继续处理 {found}",
-        }, args.output)
+        }), args.output)
     else:
-        emit({
+        emit(attach_run_context(plan, {
             "status": "ok",
             "duplicate": True,
             "current_url": url,
             "path": found,
             "recovered_previous_transaction": recovered,
             "message": f"⚠️ 已导入，路径：{found}。回复「更新」强制覆盖。",
-        }, args.output)
+        }), args.output)
 
 
 def request_text(url: str, timeout: int, allow_private: bool = False) -> Tuple[str, str]:
@@ -663,7 +768,11 @@ def fetch_article(
 
 
 def command_fetch(args: argparse.Namespace) -> None:
-    plan = read_json(args.plan_file)
+    plan = read_bound_plan(
+        args.plan_file,
+        output=args.output,
+        output_key="article_file",
+    )
     if plan.get("status") != "ok" or plan.get("mode") != "single":
         raise KiError("fetch 只接受成功的单条 plan")
     url = str(plan.get("current_url", ""))
@@ -671,6 +780,7 @@ def command_fetch(args: argparse.Namespace) -> None:
     if not ok:
         raise KiError(f"CURRENT_URL 无效：{reason}")
     payload = fetch_article(url, args.timeout, args.jina_base)
+    attach_run_context(plan, payload)
     emit(payload, args.output)
     if payload["status"] != "ok":
         raise KiError(payload["message"])
@@ -687,6 +797,13 @@ def domain_roots(vault: Path, domain: str) -> List[Path]:
 
 
 def command_scan(args: argparse.Namespace) -> None:
+    if args.plan_file:
+        read_bound_plan(
+            args.plan_file,
+            output=args.output,
+            output_key="scan_file",
+            inputs={"terms_file": args.terms_file},
+        )
     vault = vault_path(args.vault)
     terms = unique_in_order(
         term.casefold() for term in Path(args.terms_file).read_text(encoding="utf-8").splitlines() if term.strip()
@@ -1027,12 +1144,18 @@ def update_index(existing: str, meta: Dict[str, Any], relative: str, today: str)
 
     row = index_row(meta, relative)
     existing_path_pattern = re.compile(r"\]\(" + re.escape(relative) + r"\)")
-    for index in range(header_index + 2, section_end):
-        if existing_path_pattern.search(lines[index]):
-            lines[index] = row
-            break
-    else:
-        lines.insert(header_index + 2, row)
+    # Step 7 of the original /ki contract inserts the latest imported or
+    # updated document immediately below the section header.  Remove any
+    # existing row for the same path first so append/force operations keep a
+    # single index entry while still moving that entry to the newest position.
+    existing_indices = [
+        index
+        for index in range(header_index + 2, section_end)
+        if existing_path_pattern.search(lines[index])
+    ]
+    for index in reversed(existing_indices):
+        del lines[index]
+    lines.insert(header_index + 2, row)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1196,7 +1319,15 @@ def validate_analysis(meta: Dict[str, Any], current_url: str) -> Dict[str, Any]:
 
 
 def command_commit(args: argparse.Namespace) -> None:
-    plan = read_json(args.plan_file)
+    plan = read_bound_plan(
+        args.plan_file,
+        output=args.output,
+        output_key="commit_dry_file" if args.dry_run else "commit_file",
+        inputs={
+            "analysis_file": args.analysis_file,
+            "body_file": args.body_file,
+        },
+    )
     if plan.get("status") != "ok" or plan.get("mode") != "single":
         raise KiError("commit 只接受成功的单条 plan")
     current_url = str(plan.get("current_url", ""))
@@ -1321,6 +1452,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
+    init = sub.add_parser("init", help="allocate an isolated artifact directory for one /ki run")
+    init.set_defaults(handler=command_init)
+
     plan = sub.add_parser("plan", help="freeze URLs from raw /ki arguments")
     plan.add_argument("--input-file", required=True)
     plan.add_argument("--output")
@@ -1348,6 +1482,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     scan = sub.add_parser("scan", help="rank similarity candidates from the first 60 lines")
     scan.add_argument("--vault", default=configured_vault())
+    scan.add_argument("--plan-file")
     scan.add_argument("--domain", choices=("ai", "tools", "system", "all"), required=True)
     scan.add_argument("--terms-file", required=True)
     scan.add_argument("--limit", type=int, default=20)
