@@ -10,6 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGE = ROOT / "scripts/manage.py"
+COMMANDS = ("ki.md", "knowledge-import.md", "导入.md")
 
 
 class ManageTests(unittest.TestCase):
@@ -41,6 +42,22 @@ class ManageTests(unittest.TestCase):
             "--vault",
             str(self.vault),
         )
+
+    def test_command_contract_prevents_nested_skill_argument_loss(self) -> None:
+        url = "https://mp.weixin.qq.com/s/UZzha5NG4x6sei32Y338rg"
+        for name in COMMANDS:
+            command = (ROOT / "command" / name).read_text(encoding="utf-8")
+            self.assertIn("disable-model-invocation: true", command)
+            self.assertIn("禁止再次调用任何 Skill 工具", command)
+            self.assertTrue(command.rstrip().endswith("KI_RAW_ARGUMENTS_BEGIN"))
+            expanded = command + "\n" + url
+            raw = expanded.rsplit("KI_RAW_ARGUMENTS_BEGIN", 1)[1].strip()
+            self.assertEqual(raw, url)
+
+        skill = (ROOT / "skill/obsidian-knowledge-import/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("最后一个同名标记之后", skill)
+        self.assertIn("最后一个 `ARGUMENTS:` 标记之后", skill)
+        self.assertIn("不得创建空参数文件", skill)
 
     def test_clean_install_and_check(self) -> None:
         result = self.install()

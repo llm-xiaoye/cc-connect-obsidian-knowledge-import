@@ -163,6 +163,14 @@ def plan_from_raw(raw: str) -> Dict[str, Any]:
     single = False
     force = False
 
+    if not stripped:
+        return {
+            "status": "error",
+            "code": "missing-input",
+            "message": "❌ /ki 参数交接失败：未收到链接，请重新发送命令。",
+            "rejected": [],
+        }
+
     if stripped == "--force" or stripped.startswith("--force "):
         force = True
         single = True

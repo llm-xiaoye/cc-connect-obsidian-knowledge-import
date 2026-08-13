@@ -218,6 +218,15 @@ class PlanTests(unittest.TestCase):
             "❌ 单条模式参数异常",
         )
 
+    def test_empty_input_reports_argument_handoff_failure(self):
+        result = ki.plan_from_raw("  \n")
+        self.assertEqual(result["code"], "missing-input")
+        self.assertEqual(
+            result["message"],
+            "❌ /ki 参数交接失败：未收到链接，请重新发送命令。",
+        )
+        self.assertEqual(result["rejected"], [])
+
     def test_shell_metacharacters_never_execute(self):
         result = ki.plan_from_raw("https://example.com/a$(touch%20SHOULD_NOT_EXIST)")
         self.assertEqual(result["mode"], "single")

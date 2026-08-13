@@ -19,13 +19,17 @@ description: 将一个或多个公开网页、微信公众号文章链接抓取�
 
 ## 1. 冻结输入
 
-1. 将 `/ki` 命令正文最后一个 `RAW_ARGUMENTS` 标记之后的原始文本原样写入独立临时文件。禁止把原始参数拼入 Bash、Python 源码、引号或 here-document。若用户当前消息恰好是“更新”，且紧接本工作流上一条“已导入”回复，则从上一份 `plan.json` 恢复唯一的 `current_url`，把临时文件内容设为 `--force <current_url>`；除此之外禁止猜测或复用旧 URL。
-2. 执行：
+1. 当前消息若含 `KI_RAW_ARGUMENTS_BEGIN`，取最后一个同名标记之后的全部文本为原始参数。这表示 cc-connect 已经展开命令：禁止再调用任何 Skill 工具或斜杠命令，直接在当前回合继续。
+2. 若当前消息由用户直接调用本 Skill，Claude Code 会在 Skill 正文末尾注入 `ARGUMENTS: <参数>`；此时只取最后一个 `ARGUMENTS:` 标记之后的文本。禁止从 Skill 正文中的说明、示例或其他消息提取 URL。
+3. 若用户当前消息恰好是“更新”，且紧接本工作流上一条“已导入”回复，则从上一份 `plan.json` 恢复唯一的 `current_url`，把原始参数设为 `--force <current_url>`；除此之外禁止猜测或复用旧 URL。
+4. 若最终原始参数为空，回复 `❌ /ki 参数交接失败：未收到链接，请重新发送命令。` 并停止。不得创建空参数文件，不得继续调用 plan。
+5. 用 Write 将非空原始参数逐字写入独立临时文件；禁止把参数拼入 Bash、Python 源码、引号或 here-document。写入后用 Read 核对文件非空且内容逐字一致；不一致时按参数交接失败停止。
+6. 执行：
 
    `python3 .claude/skills/obsidian-knowledge-import/scripts/ki_import.py plan --input-file <raw-file> --output <plan.json>`
 
-3. 读取 `plan.json`。若 `status=error`，原样回复 `message` 并停止。
-4. 后续只使用 plan 中的 `input_urls/current_url`；不得再从正文、笔记、日志或工具输出提取 URL。
+7. 读取 `plan.json`。若 `status=error`，原样回复 `message` 并停止。
+8. 后续只使用 plan 中的 `input_urls/current_url`；不得再从正文、笔记、日志或工具输出提取 URL。
 
 ## 2. 批量模式
 
