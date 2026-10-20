@@ -1,0 +1,32 @@
+# cc-connect 脱敏示例。推荐先运行 `cc-connect web`，再按需参考本文件。
+# 环境变量必须在启动 cc-connect 的进程中可见。
+
+language = "zh"
+
+[log]
+level = "info"
+
+[[projects]]
+name = "obsidian-knowledge-import"
+
+[projects.agent]
+type = "claudecode"
+
+[projects.agent.options]
+# 必须与 scripts/manage.py install 的 --workspace 完全相同。
+work_dir = "/ABSOLUTE/PATH/TO/cc-connect-workspace"
+
+# /ki 需要执行 Python、网络抓取并写入 Vault。
+# 仅在专用 workspace 且 allow_from 已严格限制时使用此模式。
+mode = "bypassPermissions"
+
+# Telegram 仅作为平台配置示例；也可以在 cc-connect web 中配置其他平台。
+[[projects.platforms]]
+type = "telegram"
+
+[projects.platforms.options]
+token = "${TELEGRAM_BOT_TOKEN}"
+allow_from = "${TELEGRAM_USER_ID}"
+
+# /ki 不需要 admin_from。若其他管理命令确实需要，请把 admin_from 写在
+# [[projects]] 层级并只填可信用户 ID，绝不要填 "*"。

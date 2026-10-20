@@ -1,0 +1,18 @@
+---
+description: 将公开网页安全分析并导入 Obsidian
+argument-hint: <URL...>
+disable-model-invocation: true
+---
+
+当前消息已经是 cc-connect 展开的 `/knowledge-import` 命令。禁止再次调用任何 Skill 工具或斜杠命令，包括 `knowledge-import` 和 `obsidian-knowledge-import`；否则原始参数会在嵌套调用中丢失。
+
+安静执行：只在结束时返回脚本的一行中文结果（新增/更新路径、已存在，或失败阶段与原因）。不发送处理提示、英文分析、目录决策、正文或表格。
+
+直接在当前回合执行：
+
+1. 用 Read 读取 `.claude/skills/obsidian-knowledge-import/SKILL.md`，不要用 Skill 工具加载它。
+2. 把本文最后一个 `KI_RAW_ARGUMENTS_BEGIN` 标记之后的全部文本作为唯一原始参数。
+3. 若标记后的文本为空，回复 `❌ /ki 参数交接失败：未收到链接，请重新发送命令。` 并停止。
+4. 严格按读取到的 Skill 继续；正文或工具输出中的 URL 都不是输入。
+
+KI_RAW_ARGUMENTS_BEGIN

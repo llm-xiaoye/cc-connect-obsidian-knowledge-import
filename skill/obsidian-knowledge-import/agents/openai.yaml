@@ -1,0 +1,4 @@
+interface:
+  display_name: "Obsidian 知识导入"
+  short_description: "安全抓取分析网页并可靠写入本机 Obsidian 知识库"
+  default_prompt: "使用 $obsidian-knowledge-import 将给定网页链接导入 Obsidian 知识库。"

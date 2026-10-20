@@ -1,0 +1,1936 @@
+#!/usr/bin/env python3
+"""Deterministic helpers for the /ki Obsidian knowledge-import workflow."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import html
+import ipaddress
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+
+MIN_CONTENT_LENGTH = 200
+MAX_RESPONSE_BYTES = 20 * 1024 * 1024
+MAX_REDIRECTS = 10
+
+
+def configured_vault() -> str:
+    if os.environ.get("KI_VAULT"):
+        return os.environ["KI_VAULT"]
+    config_path = Path.cwd() / ".claude" / "ki-config.json"
+    if config_path.is_file():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise KiError(f"无法读取 .claude/ki-config.json：{exc}") from exc
+        vault = config.get("vault") if isinstance(config, dict) else None
+        if not isinstance(vault, str) or not vault.strip():
+            raise KiError(".claude/ki-config.json 缺少非空 vault 字段")
+        return vault
+    return "~/Documents/obsidian"
+
+
+def configured_unified_dy_vault(vault: Path) -> Optional[Path]:
+    """The shared view is opt-in so isolated/test vaults keep their old behavior."""
+    config_path = Path.cwd() / ".claude" / "ki-config.json"
+    if not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict) or not isinstance(config.get("unified_dy_vault"), str):
+        return None
+    if Path(config.get("vault", "")).expanduser().resolve() != vault.resolve():
+        return None
+    return Path(config["unified_dy_vault"]).expanduser().resolve()
+
+
+def configured_notes_root(vault: Path) -> Optional[str]:
+    config_path = Path.cwd() / ".claude" / "ki-config.json"
+    if not config_path.is_file():
+        return None
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict) or Path(config.get("vault", "")).expanduser().resolve() != vault.resolve():
+        return None
+    value = config.get("notes_root")
+    return value if isinstance(value, str) and value else None
+
+
+def configured_unified_only(vault: Path) -> bool:
+    config_path = Path.cwd() / ".claude" / "ki-config.json"
+    if not config_path.is_file():
+        return False
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return (isinstance(config, dict) and config.get("unified_only") is True
+            and Path(config.get("vault", "")).expanduser().resolve() == vault.resolve())
+
+
+def unified_store_module():
+    import unified_store
+    return unified_store
+
+
+def sync_unified_catalog(vault: Path) -> Optional[str]:
+    """Run after the KI transaction; a view failure never rolls back an import."""
+    try:
+        dy_vault = configured_unified_dy_vault(vault)
+        if dy_vault is None:
+            return None
+        script = Path(__file__).resolve().parent / "unified_catalog.py"
+        result = subprocess.run(
+            [sys.executable, "-B", str(script), "rebuild", "--vault", str(vault), "--dy-vault", str(dy_vault)],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        payload = json.loads(result.stdout)
+        if result.returncode or payload.get("status") != "ok":
+            return str(payload.get("message") or result.stderr.strip() or "未知错误")[:300]
+        return None
+    except (OSError, ValueError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        return str(exc)[:300]
+BLOCKED_EXTENSIONS = (
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mp3", ".zip", ".pdf"
+)
+URL_RE = re.compile(r'''https?://(?:\[[^\]\s]+\]|[^\s<>"'\[\]])+''')
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+LOG_HEADER = [
+    "# 导入日志",
+    "",
+    "| 时间 | 来源 URL | 写入路径 | 操作 |",
+    "| --- | --- | --- | --- |",
+]
+INDEX_TABLE = [
+    "| 文档 | type | 关键词 | 核心洞察 | 日期 |",
+    "|------|------|--------|----------|------|",
+]
+REQUIRED_BODY_SECTIONS = (
+    "## 摘要",
+    "## 核心要点",
+    "## 关键概念",
+    "## 技术细节",
+    "## 实践建议",
+    "## 局限性",
+    "## Claude点评",
+    "## 关联知识",
+)
+
+
+class KiError(Exception):
+    """A user-facing deterministic workflow error."""
+
+
+RUN_ARTIFACT_NAMES = {
+    "raw_file": "raw.txt",
+    "plan_file": "plan.json",
+    "schedule_file": "schedule.json",
+    "lookup_file": "lookup.json",
+    "article_file": "article.json",
+    "terms_file": "terms.txt",
+    "scan_file": "scan.json",
+    "body_file": "body.md",
+    "analysis_file": "analysis.json",
+    "commit_dry_file": "commit-dry.json",
+    "commit_file": "commit.json",
+    "prepare_file": "prepare.json",
+    "finish_file": "finish.json",
+}
+
+
+def run_artifacts(run_dir: Path) -> Dict[str, str]:
+    return {
+        key: str((run_dir / filename).resolve())
+        for key, filename in RUN_ARTIFACT_NAMES.items()
+    }
+
+
+def command_init(args: argparse.Namespace) -> None:
+    run_dir = Path(tempfile.mkdtemp(prefix="ki-run-")).resolve()
+    run_dir.chmod(0o700)
+    artifacts = run_artifacts(run_dir)
+    marker = {
+        "schema": 1,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "artifacts": artifacts,
+    }
+    atomic_write(
+        run_dir / ".ki-run.json",
+        json.dumps(marker, ensure_ascii=False, indent=2) + "\n",
+        0o600,
+    )
+    emit({"status": "ok", **marker})
+
+
+def emit(payload: Dict[str, Any], output: Optional[str] = None, *, view: Optional[Dict[str, Any]] = None) -> None:
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if output:
+        atomic_write(Path(output), text, 0o600)
+    sys.stdout.write(text if view is None else json.dumps(view, ensure_ascii=False, indent=2) + "\n")
+
+
+def read_json(path: str) -> Dict[str, Any]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise KiError(f"无法读取 JSON：{path}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise KiError(f"JSON 顶层必须是对象：{path}")
+    return value
+
+
+def unique_in_order(values: Iterable[str]) -> List[str]:
+    return list(dict.fromkeys(values))
+
+
+def extract_urls(raw: str) -> List[str]:
+    """Extract display-wrapped links without changing URL order or query values."""
+    explicit = list(URL_RE.finditer(raw))
+    candidates = [(match.start(), match.group()) for match in explicit]
+    bare_wechat = re.compile(
+        r'''(?<![\w./:@-])(?:[a-z0-9-]+\.)*weixin\.qq\.com(?::[0-9]+)?/[^\s<>"'\[\]]*''',
+        re.IGNORECASE,
+    )
+    candidates.extend(
+        (match.start(), "https://" + match.group())
+        for match in bare_wechat.finditer(raw)
+        if not any(found.start() <= match.start() < found.end() for found in explicit)
+    )
+    accepted = []
+    closing = {")": "(", "]": "[", "}": "{"}
+    for _, candidate in sorted(candidates, key=lambda item: item[0]):
+        candidate = re.sub(r"&(?:amp|#0*38|#x0*26);", "&", candidate, flags=re.IGNORECASE)
+        candidate = candidate.rstrip("，。；！、…“”‘’）】》")
+        while candidate and candidate[-1] in closing:
+            last = candidate[-1]
+            if candidate.count(last) <= candidate.count(closing[last]):
+                break
+            candidate = candidate[:-1].rstrip("，。；！、…“”‘’）】》")
+        accepted.append(candidate)
+    return unique_in_order(accepted)
+
+
+def validate_url(raw: str) -> Tuple[bool, str]:
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        host = (parsed.hostname or "").lower()
+        port = parsed.port
+    except ValueError:
+        return False, "URL 不完整"
+    if parsed.scheme not in ("http", "https") or not host:
+        return False, "URL 不完整"
+    if parsed.username or parsed.password:
+        return False, "URL 不允许包含用户凭据"
+    if port is not None and not (1 <= port <= 65535):
+        return False, "URL 端口无效"
+    path = parsed.path.rstrip("/")
+    if host == "mmbiz.qpic.cn":
+        return False, "微信 CDN 图片"
+    if host == "mp.weixin.qq.com" and path == "/s" and not parsed.query:
+        return False, "微信公众号文章路径不完整"
+    if parsed.path.lower().endswith(BLOCKED_EXTENSIONS):
+        return False, "非网页内容"
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        return False, "URL 含控制字符"
+    if host == "localhost" or host.endswith(".localhost") or host.endswith(".local"):
+        return False, "URL 必须指向公开网络地址"
+    try:
+        if not ipaddress.ip_address(host).is_global:
+            return False, "URL 必须指向公开网络地址"
+    except ValueError:
+        pass
+    return True, ""
+
+
+def public_addresses(url: str, allow_private: bool = False) -> List[str]:
+    ok, reason = validate_url(url)
+    if not ok and not (allow_private and reason == "URL 必须指向公开网络地址"):
+        raise OSError(f"URL 拒绝访问：{reason}")
+    host = urllib.parse.urlparse(url).hostname or ""
+    try:
+        addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise OSError(f"域名解析失败：{host}: {exc}") from exc
+    if not addresses:
+        raise OSError(f"域名没有可用地址：{host}")
+    result: List[str] = []
+    for address in addresses:
+        ip = ipaddress.ip_address(address[4][0].split("%", 1)[0])
+        if not allow_private and not ip.is_global:
+            raise OSError(f"URL 解析到非公开地址：{host} -> {ip}")
+        result.append(str(ip))
+    return unique_in_order(result)
+
+
+def assert_public_url(url: str, allow_private: bool = False) -> None:
+    public_addresses(url, allow_private)
+
+
+def plan_from_raw(raw: str) -> Dict[str, Any]:
+    stripped = raw.strip()
+    rejected: List[Dict[str, str]] = []
+    single = False
+    force = False
+
+    if not stripped:
+        return {
+            "status": "error",
+            "code": "missing-input",
+            "message": "❌ /ki 参数交接失败：未收到链接，请重新发送命令。",
+            "rejected": [],
+        }
+
+    if stripped == "--force" or stripped.startswith("--force "):
+        force = True
+        single = True
+        value = stripped[len("--force"):].strip()
+        urls = URL_RE.findall(value)
+        if len(urls) != 1 or value != urls[0]:
+            return {
+                "status": "error",
+                "code": "single-arguments-invalid",
+                "message": "❌ 单条模式参数异常",
+            }
+        ok, reason = validate_url(urls[0])
+        if not ok:
+            return {
+                "status": "error",
+                "code": "single-arguments-invalid",
+                "message": "❌ 单条模式参数异常",
+                "rejected": [{"url": urls[0], "reason": reason}],
+            }
+        accepted = [urls[0]]
+    elif stripped == "--single" or stripped.startswith("--single "):
+        single = True
+        value = stripped[len("--single"):].strip()
+        urls = URL_RE.findall(value)
+        if len(urls) != 1 or value != urls[0]:
+            return {
+                "status": "error",
+                "code": "single-arguments-invalid",
+                "message": "❌ 单条模式参数异常",
+            }
+        ok, reason = validate_url(urls[0])
+        if not ok:
+            return {
+                "status": "error",
+                "code": "single-arguments-invalid",
+                "message": "❌ 单条模式参数异常",
+                "rejected": [{"url": urls[0], "reason": reason}],
+            }
+        accepted = [urls[0]]
+    else:
+        raw_urls = extract_urls(raw)
+        accepted = []
+        for url in raw_urls:
+            ok, reason = validate_url(url)
+            if ok:
+                accepted.append(url)
+            else:
+                rejected.append({"url": url, "reason": reason})
+        if not accepted:
+            return {
+                "status": "error",
+                "code": "no-valid-url",
+                "message": "❌ 未检测到有效 URL",
+                "rejected": rejected,
+            }
+
+    mode = "single" if single or len(accepted) == 1 else "batch"
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "mode": mode,
+        "input_urls": accepted,
+        "rejected": rejected,
+    }
+    if mode == "single":
+        result["current_url"] = accepted[0]
+        result["force"] = force
+    return result
+
+
+def command_plan(args: argparse.Namespace) -> None:
+    input_path = Path(args.input_file).expanduser().resolve()
+    raw = input_path.read_text(encoding="utf-8")
+    result = plan_from_raw(raw)
+    marker_path = input_path.parent / ".ki-run.json"
+    if marker_path.is_file():
+        marker = read_json(str(marker_path))
+        artifacts = marker.get("artifacts")
+        if not isinstance(artifacts, dict):
+            raise KiError("运行目录清单无效")
+        expected_raw = Path(str(artifacts.get("raw_file", ""))).resolve()
+        expected_plan = Path(str(artifacts.get("plan_file", ""))).resolve()
+        if input_path != expected_raw or not args.output:
+            raise KiError("运行文件未使用 init 分配的独立路径")
+        if Path(args.output).expanduser().resolve() != expected_plan:
+            raise KiError("plan 输出未使用 init 分配的独立路径")
+        result.update({
+            "run_id": marker.get("run_id"),
+            "run_dir": marker.get("run_dir"),
+            "artifacts": artifacts,
+        })
+    emit(result, args.output)
+
+
+def read_bound_plan(
+    plan_file: str,
+    *,
+    output: Optional[str] = None,
+    output_key: Optional[str] = None,
+    inputs: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    plan_path = Path(plan_file).expanduser().resolve()
+    plan = read_json(str(plan_path))
+    artifacts = plan.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return plan
+    expected_plan = Path(str(artifacts.get("plan_file", ""))).resolve()
+    if plan_path != expected_plan:
+        raise KiError("plan 文件与本次独立运行目录不一致")
+    if output_key:
+        if not output:
+            raise KiError(f"{output_key} 必须写入本次独立运行目录")
+        expected_output = Path(str(artifacts.get(output_key, ""))).resolve()
+        if Path(output).expanduser().resolve() != expected_output:
+            raise KiError(f"{output_key} 与本次独立运行目录不一致")
+    for artifact_key, raw_path in (inputs or {}).items():
+        expected_input = Path(str(artifacts.get(artifact_key, ""))).resolve()
+        if Path(raw_path).expanduser().resolve() != expected_input:
+            raise KiError(f"{artifact_key} 与本次独立运行目录不一致")
+    return plan
+
+
+def attach_run_context(plan: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(plan.get("artifacts"), dict):
+        payload.update({
+            "run_id": plan.get("run_id"),
+            "run_dir": plan.get("run_dir"),
+            "artifacts": plan.get("artifacts"),
+        })
+    return payload
+
+
+def command_schedule(args: argparse.Namespace) -> None:
+    plan = read_bound_plan(
+        args.plan_file,
+        output=args.output,
+        output_key="schedule_file",
+    )
+    if plan.get("status") != "ok" or plan.get("mode") != "batch":
+        raise KiError("schedule 只接受成功的批量 plan")
+    urls = plan.get("input_urls")
+    if not isinstance(urls, list) or len(urls) < 2:
+        raise KiError("批量 plan 至少需要两个 URL")
+
+    binary = args.cc_connect or shutil.which("cc-connect")
+    if not binary:
+        raise KiError("找不到 cc-connect 可执行文件")
+    results: List[Dict[str, Any]] = []
+    failures: List[Dict[str, Any]] = []
+    created_timer_ids: List[str] = []
+    for url in urls:
+        if not isinstance(url, str) or not validate_url(url)[0]:
+            raise KiError("plan 中包含无效 URL")
+        command = [
+            binary,
+            "timer", "add",
+            "--delay", "10s",
+            "--session-mode", "new-per-run",
+            "--prompt", f"/ki --single {url}",
+            "--desc", "ki-batch",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=args.timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            completed = subprocess.CompletedProcess(command, 124, "", str(exc))
+        entry = {
+            "url": url,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+        timer_match = re.search(r"(?m)^Timer created:\s*(\S+)\s*$", completed.stdout)
+        if completed.returncode == 0 and timer_match:
+            entry["timer_id"] = timer_match.group(1)
+            created_timer_ids.append(timer_match.group(1))
+        results.append(entry)
+        if completed.returncode != 0:
+            failures.append(entry)
+    payload = {
+        "status": "error" if failures else "ok",
+        "scheduled": len(results) - len(failures),
+        "total": len(results),
+        "results": results,
+    }
+    if failures and created_timer_ids:
+        rollback_results = []
+        for timer_id in reversed(created_timer_ids):
+            deleted = subprocess.run(
+                [binary, "timer", "del", timer_id],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=args.timeout,
+            )
+            rollback_results.append({
+                "timer_id": timer_id,
+                "returncode": deleted.returncode,
+                "stdout": deleted.stdout.strip(),
+                "stderr": deleted.stderr.strip(),
+            })
+        payload["rollback"] = rollback_results
+        payload["rolled_back"] = sum(item["returncode"] == 0 for item in rollback_results)
+    if not failures:
+        payload["message"] = f"已排队 {len(urls)} 条，完成后逐条返回结果。"
+    emit(payload, args.output)
+    if failures:
+        raise KiError(f"{len(failures)} 条 timer 创建失败")
+
+
+def vault_path(value: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.is_dir():
+        raise KiError(f"Vault 不存在或不是目录：{path}")
+    return path
+
+
+def parse_markdown_row(line: str, expected: int) -> Optional[List[str]]:
+    if not line.startswith("|") or not line.rstrip().endswith("|"):
+        return None
+    cells: List[str] = []
+    current: List[str] = []
+    escaped = False
+    for char in line.strip()[1:-1]:
+        if escaped:
+            current.append(char)
+            escaped = False
+        elif char == "\\":
+            current.append(char)
+            escaped = True
+        elif char == "|":
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+    cells.append("".join(current).strip())
+    return cells if len(cells) == expected else None
+
+
+def markdown_unescape(value: str) -> str:
+    return value.replace(r"\|", "|").replace(r"\\", "\\")
+
+
+def find_log_url(log_path: Path, url: str) -> Optional[str]:
+    if not log_path.exists():
+        return None
+    for line in log_path.read_text(encoding="utf-8").splitlines()[4:]:
+        cells = parse_markdown_row(line, 4)
+        if not cells or markdown_unescape(cells[1]) != url:
+            continue
+        match = re.search(r"\]\(([^)]+)\)", cells[2])
+        return match.group(1) if match else ""
+    return None
+
+
+def command_lookup(args: argparse.Namespace) -> None:
+    plan = read_bound_plan(
+        args.plan_file,
+        output=args.output,
+        output_key="lookup_file",
+    )
+    if plan.get("status") != "ok" or plan.get("mode") != "single":
+        raise KiError("lookup 只接受成功的单条 plan")
+    url = str(plan.get("current_url", ""))
+    vault = vault_path(args.vault)
+    with vault_lock(vault):
+        recovered = recover_journal(vault)
+        found = (unified_store_module().find_ki_url(vault, url) if configured_unified_only(vault)
+                 else find_log_url(vault / "_import-log.md", url))
+    if found is None:
+        emit(attach_run_context(plan, {
+            "status": "ok",
+            "duplicate": False,
+            "current_url": url,
+            "recovered_previous_transaction": recovered,
+        }), args.output)
+    elif plan.get("force") is True:
+        emit(attach_run_context(plan, {
+            "status": "ok",
+            "duplicate": True,
+            "bypass": True,
+            "current_url": url,
+            "path": found,
+            "recovered_previous_transaction": recovered,
+            "message": f"已确认更新：继续处理 {found}",
+        }), args.output)
+    else:
+        emit(attach_run_context(plan, {
+            "status": "ok",
+            "duplicate": True,
+            "current_url": url,
+            "path": found,
+            "recovered_previous_transaction": recovered,
+            "message": f"已存在：{found}（回复“更新”可覆盖）",
+        }), args.output)
+
+
+def request_text(url: str, timeout: int, allow_private: bool = False) -> Tuple[str, str]:
+    """Fetch through the pinned-IP curl implementation."""
+    return curl_text(url, timeout, allow_private=allow_private)
+
+
+def curl_text(url: str, timeout: int, allow_private: bool = False) -> Tuple[str, str]:
+    """Fetch with curl argv, validating each redirect before following it."""
+    curl = shutil.which("curl") or "/usr/bin/curl"
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        addresses = public_addresses(current, allow_private)
+        parsed = urllib.parse.urlparse(current)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        with tempfile.TemporaryDirectory(prefix="ki-curl-") as directory:
+            header_path = Path(directory) / "headers"
+            body_path = Path(directory) / "body"
+            command = [
+                curl,
+                "-sS",
+                "--compressed",
+                "--max-time",
+                str(timeout),
+                "--connect-timeout",
+                str(min(timeout, 10)),
+                "--max-filesize",
+                str(MAX_RESPONSE_BYTES),
+                "--noproxy",
+                "*",
+                "--dump-header",
+                str(header_path),
+                "--output",
+                str(body_path),
+                "-A",
+                USER_AGENT,
+            ]
+            result = None
+            errors = []
+            for address in addresses:
+                resolved_address = f"[{address}]" if ":" in address else address
+                pinned = [
+                    *command,
+                    "--resolve",
+                    f"{host}:{port}:{resolved_address}",
+                    current,
+                ]
+                try:
+                    attempt = subprocess.run(
+                        pinned,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=timeout + 5,
+                        check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    errors.append(str(exc))
+                    continue
+                result = attempt
+                if attempt.returncode == 0:
+                    break
+                errors.append(attempt.stderr.decode("utf-8", errors="replace").strip())
+            if result is None:
+                raise OSError("curl 执行失败：" + "; ".join(errors)[:500])
+            if result.returncode != 0:
+                raise OSError(f"curl 退出码 {result.returncode}：{'; '.join(errors)[:500]}")
+            header_text = header_path.read_text(encoding="iso-8859-1") if header_path.exists() else ""
+            blocks = [block for block in re.split(r"\r?\n\r?\n", header_text) if block.startswith("HTTP/")]
+            last_header = blocks[-1] if blocks else ""
+            status_match = re.match(r"HTTP/\S+\s+(\d{3})", last_header)
+            status = int(status_match.group(1)) if status_match else 0
+            location_match = re.search(r"(?mi)^Location:\s*(.+?)\s*$", last_header)
+            if status in (301, 302, 303, 307, 308) and location_match:
+                current = urllib.parse.urljoin(current, location_match.group(1))
+                continue
+            if not 200 <= status < 300:
+                raise OSError(f"HTTP 状态 {status}，未取得成功的网页响应")
+            raw = body_path.read_bytes() if body_path.exists() else b""
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise OSError(f"响应超过 {MAX_RESPONSE_BYTES // (1024 * 1024)} MiB 上限")
+            return raw.decode("utf-8", errors="replace"), "utf-8"
+    raise OSError(f"重定向超过 {MAX_REDIRECTS} 次")
+
+
+def normalize_text(value: str) -> str:
+    value = html.unescape(value).replace("\u200b", "")
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n[ \t]+", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value)
+    return value.strip()
+
+
+def strip_html(source: str, selector: Optional[str] = None) -> str:
+    """Extract a complete subtree without an optional parser dependency.
+
+    A non-greedy regex stops at the first nested closing tag in js_content,
+    silently reducing a full WeChat article to its opening paragraph.
+    """
+    from html.parser import HTMLParser
+
+    if selector is not None and (not selector.startswith("#") or len(selector) < 2):
+        raise ValueError("Only an element ID selector is supported")
+    target_id = selector[1:] if selector else None
+    void_tags = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    block_tags = {"article", "aside", "blockquote", "br", "div", "dl", "dt", "dd", "figcaption", "figure", "footer", "header", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "li", "main", "ol", "p", "pre", "section", "table", "td", "th", "tr", "ul"}
+    excluded_tags = {"script", "style", "noscript", "svg"}
+
+    class TextParser(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__(convert_charrefs=True)
+            self.stack: List[Tuple[str, bool, bool]] = []
+            self.parts: List[str] = []
+            self.selected = False
+
+        def state(self) -> Tuple[bool, bool]:
+            return self.stack[-1][1:] if self.stack else (target_id is None, False)
+
+        def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+            active, excluded = self.state()
+            if target_id is not None and not self.selected and dict(attrs).get("id") == target_id:
+                active = True
+                self.selected = True
+            excluded = excluded or tag in excluded_tags
+            if active and not excluded and tag in block_tags:
+                self.parts.append("\n")
+            if tag not in void_tags:
+                self.stack.append((tag, active, excluded))
+
+        def handle_endtag(self, tag: str) -> None:
+            for index in range(len(self.stack) - 1, -1, -1):
+                if self.stack[index][0] == tag:
+                    active, excluded = self.state()
+                    if active and not excluded and tag in block_tags:
+                        self.parts.append("\n")
+                    del self.stack[index:]
+                    return
+
+        def handle_startendtag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+            self.handle_starttag(tag, attrs)
+            if tag not in void_tags:
+                self.handle_endtag(tag)
+
+        def handle_data(self, data: str) -> None:
+            active, excluded = self.state()
+            if active and not excluded:
+                self.parts.append(data)
+
+    parser = TextParser()
+    parser.feed(source)
+    parser.close()
+    return normalize_text("".join(parser.parts))
+
+
+def decode_js_string(value: str) -> str:
+    value = re.sub(r"\\u([0-9a-fA-F]{4})", lambda m: chr(int(m.group(1), 16)), value)
+    value = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), value)
+    return html.unescape(
+        value.replace(r"\/", "/").replace(r"\'", "'").replace(r'\"', '"').replace(r"\\", "\\")
+    ).strip()
+
+
+def parse_wechat(source: str) -> Tuple[str, str, str]:
+    title = ""
+    for pattern in (
+        r"var\s+msg_title\s*=\s*'((?:\\.|[^'\\])*)'",
+        r'var\s+msg_title\s*=\s*"((?:\\.|[^"\\])*)"',
+        r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']',
+    ):
+        match = re.search(pattern, source, flags=re.I | re.S)
+        if match:
+            title = decode_js_string(match.group(1))
+            break
+    article_date = ""
+    match = re.search(r"var\s+ct\s*=\s*['\"]?(\d{9,13})", source)
+    if match:
+        stamp = int(match.group(1))
+        if stamp > 10_000_000_000:
+            stamp //= 1000
+        article_date = dt.datetime.fromtimestamp(stamp).astimezone().date().isoformat()
+    body = strip_html(source, "#js_content")
+    return title, article_date, body
+
+
+def source_author_name(source: str, *, wechat: bool = False) -> str:
+    """Read explicit byline/account metadata; never infer it from article content."""
+    def clean(value: str) -> str:
+        value = normalize_text(value or "").strip()
+        if not value or len(value) > 120 or "\n" in value or re.match(r"https?://", value):
+            return ""
+        return value
+
+    if wechat:
+        for selector in ("#js_author_name", "#js_name", "#profile_nickname"):
+            value = clean(strip_html(source, selector))
+            if value:
+                return value
+        for pattern in (
+            r"var\s+nick_name\s*=\s*'((?:\\.|[^'\\])*)'",
+            r'var\s+nick_name\s*=\s*"((?:\\.|[^"\\])*)"',
+        ):
+            match = re.search(pattern, source, flags=re.I | re.S)
+            if match:
+                value = clean(decode_js_string(match.group(1)))
+                if value:
+                    return value
+        return ""
+
+    from html.parser import HTMLParser
+
+    class AuthorParser(HTMLParser):
+        value = ""
+
+        def handle_starttag(self, tag, attrs):
+            fields = dict(attrs)
+            if tag.lower() == "meta" and (fields.get("name") or "").lower() == "author":
+                self.value = self.value or clean(fields.get("content", ""))
+
+    parser = AuthorParser(convert_charrefs=True)
+    parser.feed(source)
+    parser.close()
+    return parser.value
+
+
+def article_author_name(plan: Dict[str, Any]) -> str:
+    """Only the fetched article bound to this URL/run may supply a log author."""
+    artifacts = plan.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts.get("article_file"):
+        return ""
+    path = Path(str(artifacts["article_file"])).expanduser().resolve()
+    if not path.is_file():
+        return ""
+    article = read_json(str(path))
+    if not isinstance(article, dict) or article.get("status") != "ok":
+        return ""
+    if article.get("source_url") != plan.get("current_url"):
+        raise KiError("作者来源文章与本次链接不一致")
+    if any(article.get(key) != plan.get(key) for key in ("run_id", "run_dir", "artifacts")):
+        raise KiError("作者来源文章与本次运行不一致")
+    value = article.get("author_name", "")
+    return value.strip() if isinstance(value, str) and 0 < len(value.strip()) <= 120 else ""
+
+
+def parse_generic_html(source: str) -> Tuple[str, str, str]:
+    title = ""
+    for pattern in (
+        r'<meta\s+property=["\']og:title["\']\s+content=["\'](.*?)["\']',
+        r"<title[^>]*>(.*?)</title>",
+    ):
+        match = re.search(pattern, source, flags=re.I | re.S)
+        if match:
+            title = normalize_text(re.sub(r"<[^>]+>", "", match.group(1)))
+            break
+    article_date = ""
+    for pattern in (
+        r'<meta\s+property=["\']article:published_time["\']\s+content=["\'](.*?)["\']',
+        r'<time[^>]+datetime=["\'](.*?)["\']',
+    ):
+        match = re.search(pattern, source, flags=re.I | re.S)
+        if match:
+            date_match = re.search(r"\d{4}-\d{2}-\d{2}", match.group(1))
+            if date_match:
+                article_date = date_match.group(0)
+                break
+    return title, article_date, strip_html(source)
+
+
+def parse_jina(source: str) -> Tuple[str, str, str]:
+    title_match = re.search(r"(?m)^Title:\s*(.+)$", source)
+    title = normalize_text(title_match.group(1)) if title_match else ""
+    date_match = re.search(
+        r"(?mi)^(?:Published Time|Published|Date):\s*.*?(\d{4}-\d{2}-\d{2})",
+        source,
+    )
+    article_date = date_match.group(1) if date_match else ""
+    marker = re.search(r"(?mi)^Markdown Content:\s*$", source)
+    body = source[marker.end():] if marker else source
+    return title, article_date, normalize_text(body)
+
+
+def safe_jina_url(base: str, current_url: str) -> str:
+    if "{url}" in base:
+        return base.format(url=urllib.parse.quote(current_url, safe=""))
+    return base.rstrip("/") + "/" + current_url
+
+
+def fetch_article(
+    current_url: str,
+    timeout: int,
+    jina_base: str,
+    allow_private: bool = False,
+) -> Dict[str, Any]:
+    host = (urllib.parse.urlparse(current_url).hostname or "").lower()
+    methods = ("direct", "jina") if host == "mp.weixin.qq.com" else ("jina", "direct")
+    parsed = {"jina": ("", "", ""), "direct": ("", "", "")}
+    errors = {"jina": "", "direct": ""}
+    authors = {"jina": "", "direct": ""}
+    attempts: List[Dict[str, Any]] = []
+    selected = ""
+    for method in methods:
+        try:
+            if method == "jina":
+                source, _ = request_text(safe_jina_url(jina_base, current_url), timeout, allow_private=allow_private)
+                parsed[method] = parse_jina(source)
+            else:
+                source, _ = curl_text(current_url, timeout, allow_private=allow_private)
+                parsed[method] = parse_wechat(source) if host == "mp.weixin.qq.com" else parse_generic_html(source)
+                authors[method] = source_author_name(source, wechat=host == "mp.weixin.qq.com")
+        except (OSError, urllib.error.URLError, ValueError) as exc:
+            errors[method] = str(exc)
+        length = len(parsed[method][2])
+        attempts.append({"method": method, "content_length": length, "error": errors[method]})
+        if length >= MIN_CONTENT_LENGTH:
+            selected = method
+            break
+
+    jina_length, direct_length = len(parsed["jina"][2]), len(parsed["direct"][2])
+    if not selected:
+        details = []
+        for method in methods:
+            error = errors[method]
+            label = "Jina 代理" if method == "jina" else "网页直连"
+            if error:
+                reason = "连接或响应超时" if re.search(r"timeout|timed out|退出码 28", error, re.I) else "网络或 HTTP 请求失败"
+                details.append(label + reason)
+        reason_text = "；".join(details) + "。" if details else "网页未返回足够的可提取正文。"
+        return {
+            "status": "error",
+            "code": "fetch-insufficient",
+            "message": (
+                f"❌ 未取得可用正文（网页直连: {direct_length}字 / Jina 代理: {jina_length}字）。"
+                + reason_text + "不能据此判断文章收费。请在浏览器核对是否出现验证、登录或页面失效提示；正文可见时可复制正文重发。"
+            ),
+            "jina_length": jina_length,
+            "direct_length": direct_length,
+            "jina_error": errors["jina"],
+            "direct_error": errors["direct"],
+            "attempts": attempts,
+        }
+    title, article_date, body = parsed[selected]
+    if not title:
+        title = parsed["direct"][0] or parsed["jina"][0]
+    if not article_date:
+        article_date = parsed["direct"][1] or parsed["jina"][1] or dt.date.today().isoformat()
+    return {
+        "status": "ok",
+        "source_url": current_url,
+        "title": title,
+        "article_date": article_date,
+        "author_name": authors[selected] or authors["direct"],
+        "article_text": body,
+        "content_length": len(body),
+        "method": selected,
+        "jina_length": jina_length,
+        "direct_length": direct_length,
+        "attempts": attempts,
+    }
+
+
+def command_fetch(args: argparse.Namespace) -> None:
+    plan = read_bound_plan(
+        args.plan_file,
+        output=args.output,
+        output_key="article_file",
+    )
+    if plan.get("status") != "ok" or plan.get("mode") != "single":
+        raise KiError("fetch 只接受成功的单条 plan")
+    url = str(plan.get("current_url", ""))
+    ok, reason = validate_url(url)
+    if not ok:
+        raise KiError(f"CURRENT_URL 无效：{reason}")
+    payload = fetch_article(url, args.timeout, args.jina_base)
+    attach_run_context(plan, payload)
+    emit(payload, args.output)
+    if payload["status"] != "ok":
+        raise KiError(payload["message"])
+
+
+def domain_roots(vault: Path, domain: str) -> List[Path]:
+    notes_root = configured_notes_root(vault)
+    if notes_root:
+        base = vault / notes_root
+        mapping = {"ai": [base / "AI"], "tools": [base / "开发工具"],
+                   "system": [base / "系统与运维"], "all": [base]}
+        return [root for root in mapping[domain] if root.exists()]
+    mapping = {
+        "ai": [vault / "AI", vault / "knowledge-base"],
+        "tools": [vault / "工具"],
+        "system": [vault / "系统"],
+        "all": [vault],
+    }
+    return [root for root in mapping[domain] if root.exists()]
+
+
+def command_scan(args: argparse.Namespace) -> None:
+    if args.plan_file:
+        read_bound_plan(
+            args.plan_file,
+            output=args.output,
+            output_key="scan_file",
+            inputs={"terms_file": args.terms_file},
+        )
+    vault = vault_path(args.vault)
+    terms = unique_in_order(
+        term.casefold() for term in Path(args.terms_file).read_text(encoding="utf-8").splitlines() if term.strip()
+    )
+    scored: List[Tuple[int, float, str, str]] = []
+    for root in domain_roots(vault, args.domain):
+        for path in root.rglob("*.md"):
+            if path.relative_to(vault).as_posix() in {
+                "_import-log.md", "_knowledge-index.md", "知识总索引.md", "导入总日志.md",
+                "DY-知识索引.md", "DY-更新日志.md",
+            }:
+                continue
+            try:
+                first_lines = "\n".join(path.read_text(encoding="utf-8").splitlines()[:60])
+            except OSError:
+                continue
+            haystack = (path.stem + "\n" + first_lines).casefold()
+            hits = sum(1 for term in terms if term and term in haystack)
+            if not hits:
+                continue
+            density = hits / max(len(terms), 1)
+            excerpt = normalize_text(first_lines)[: args.excerpt_chars]
+            scored.append((hits, density, path.relative_to(vault).as_posix(), excerpt))
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    payload = {
+        "status": "ok",
+        "domain": args.domain,
+        "terms": terms,
+        "candidate_count": len(scored),
+        "candidates": [
+            {"path": path, "term_hits": hits, "term_density": density, "excerpt": excerpt}
+            for hits, density, path, excerpt in scored[: args.limit]
+        ],
+    }
+    view = None
+    if getattr(args, "compact", False):
+        if not args.output:
+            raise KiError("精简扫描必须用 --output 保留完整候选")
+        view = {
+            "status": "ok",
+            "candidate_count": len(scored),
+            "stored_count": len(payload["candidates"]),
+            "more_stored_candidates": len(payload["candidates"]) > 6,
+            "more_matches": len(scored) > len(payload["candidates"]),
+            "scan_file": args.output,
+            "candidates": [
+                {**item, "excerpt": item["excerpt"][:350]}
+                for item in payload["candidates"][:6]
+            ],
+        }
+    emit(payload, args.output, view=view)
+
+
+def safe_relative_path(vault: Path, value: str) -> Tuple[str, Path]:
+    if any(char in value for char in "\n\r|\\"):
+        raise KiError("写入路径含 Markdown 表格非法字符")
+    relative = Path(value)
+    if relative.is_absolute() or not value or "\x00" in value:
+        raise KiError("写入路径必须是 Vault 相对路径")
+    if any(part in ("", ".", "..") for part in relative.parts):
+        raise KiError("写入路径包含非法片段")
+    if relative.suffix.lower() != ".md":
+        raise KiError("写入路径必须以 .md 结尾")
+    target = vault.joinpath(relative)
+    resolved_parent = target.parent.resolve()
+    try:
+        resolved_parent.relative_to(vault.resolve())
+    except ValueError as exc:
+        raise KiError("写入路径越出 Vault") from exc
+    if target.exists():
+        try:
+            target.resolve().relative_to(vault.resolve())
+        except ValueError as exc:
+            raise KiError("写入目标通过软链接越出 Vault") from exc
+    return relative.as_posix(), target
+
+
+def markdown_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def yaml_quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def validate_iso_date(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise KiError(f"{field} 必须是 YYYY-MM-DD")
+    try:
+        return dt.date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise KiError(f"{field} 必须是 YYYY-MM-DD") from exc
+
+
+def validate_tags(value: Any) -> List[str]:
+    if not isinstance(value, list) or not 3 <= len(value) <= 12:
+        raise KiError("tags 必须是 3-12 个字符串")
+    tags: List[str] = []
+    for tag in value:
+        if not isinstance(tag, str) or not tag.strip() or any(ch in tag for ch in "\n\r|"):
+            raise KiError("tags 包含无效值")
+        tags.append(tag.strip())
+    return unique_in_order(tags)
+
+
+def validate_single_line(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or any(ch in value for ch in "\n\r"):
+        raise KiError(f"{field} 必须是非空单行字符串")
+    return value.strip()
+
+
+def validate_body(body: str) -> str:
+    body = body.strip() + "\n"
+    missing = [heading for heading in REQUIRED_BODY_SECTIONS if heading not in body]
+    if missing:
+        raise KiError("笔记正文缺少章节：" + "、".join(missing))
+    if body.startswith("---"):
+        raise KiError("body_file 只应包含正文，不应包含 frontmatter")
+    return body
+
+
+def build_new_note(meta: Dict[str, Any], current_url: str, today: str, body: str) -> str:
+    title = validate_single_line(meta["title"], "title")
+    article_date = validate_iso_date(meta["article_date"], "article_date")
+    tags = validate_tags(meta["tags"])
+    note_type = validate_single_line(meta["type"], "type")
+    lines = [
+        "---",
+        f"title: {yaml_quote(title)}",
+        f"source_url: {yaml_quote(current_url)}",
+        "sources:",
+        f"  - {yaml_quote(current_url)}",
+        f"date: {article_date}",
+        f"created: {today}",
+        f"updated: {today}",
+        "tags:",
+    ]
+    lines.extend(f"  - {yaml_quote(tag)}" for tag in tags)
+    lines.extend([f"type: {yaml_quote(note_type)}", "---", "", body.rstrip(), ""])
+    return "\n".join(lines)
+
+
+def split_frontmatter(note: str) -> Tuple[List[str], str]:
+    lines = note.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise KiError("追加目标缺少 YAML frontmatter")
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration as exc:
+        raise KiError("追加目标 frontmatter 未闭合") from exc
+    return lines[1:end], "\n".join(lines[end + 1:]).strip("\n")
+
+
+def field_bounds(lines: List[str], key: str) -> Optional[Tuple[int, int]]:
+    start = None
+    for index, line in enumerate(lines):
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*):(?:\s|$)", line)
+        if match and match.group(1) == key:
+            start = index
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_-]*:(?:\s|$)", lines[index]):
+            end = index
+            break
+    return start, end
+
+
+def parse_yaml_list(lines: List[str], key: str) -> List[str]:
+    bounds = field_bounds(lines, key)
+    if not bounds:
+        return []
+    start, end = bounds
+    value = lines[start].split(":", 1)[1].strip()
+    if value.startswith("[") and value.endswith("]"):
+        try:
+            parsed = json.loads(value.replace("'", '"'))
+            return [str(item) for item in parsed] if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return [part.strip().strip('"\'') for part in value[1:-1].split(",") if part.strip()]
+    result = []
+    for line in lines[start + 1:end]:
+        match = re.match(r"^\s*-\s*(.*?)\s*$", line)
+        if match:
+            result.append(match.group(1).strip('"\''))
+    return result
+
+
+def parse_yaml_scalar(lines: List[str], key: str) -> str:
+    bounds = field_bounds(lines, key)
+    if not bounds:
+        return ""
+    value = lines[bounds[0]].split(":", 1)[1].strip()
+    return value.strip('"\'')
+
+
+def replace_yaml_field(lines: List[str], key: str, replacement: List[str]) -> List[str]:
+    bounds = field_bounds(lines, key)
+    if bounds:
+        start, end = bounds
+        return lines[:start] + replacement + lines[end:]
+    return lines + replacement
+
+
+def update_append_note(
+    existing: str,
+    current_url: str,
+    today: str,
+    new_tags: Sequence[str],
+    append_content: str,
+) -> Tuple[str, Dict[str, Any]]:
+    front, body = split_frontmatter(existing)
+    previous_sources = parse_yaml_list(front, "sources")
+    legacy_source = parse_yaml_scalar(front, "source")
+    legacy_url = legacy_source if legacy_source.startswith(("https://", "http://")) else ""
+    sources = unique_in_order(previous_sources + ([legacy_url] if legacy_url else []) + [current_url])
+    tags = unique_in_order(parse_yaml_list(front, "tags") + list(new_tags))
+    original_url = parse_yaml_scalar(front, "source_url")
+    if not original_url.startswith(("https://", "http://")):
+        original_url = next((url for url in previous_sources if url.startswith(("https://", "http://"))), legacy_url or current_url)
+    front = replace_yaml_field(front, "source_url", [f"source_url: {yaml_quote(original_url)}"])
+    front = replace_yaml_field(front, "sources", ["sources:"] + [f"  - {yaml_quote(v)}" for v in sources])
+    front = replace_yaml_field(front, "updated", [f"updated: {today}"])
+    front = replace_yaml_field(front, "tags", ["tags:"] + [f"  - {yaml_quote(v)}" for v in tags])
+    date_value = parse_yaml_scalar(front, "date")
+    validate_iso_date(date_value, "原笔记 date")
+    title = parse_yaml_scalar(front, "title")
+    note_type = parse_yaml_scalar(front, "type")
+    if not title or not note_type:
+        raise KiError("追加目标缺少 title 或 type")
+    content = append_content.strip()
+    if not re.match(r"^## 补充 \d{4}-\d{2}-\d{2}(?:\s|$)", content):
+        raise KiError("追加正文必须以“## 补充 YYYY-MM-DD”开头")
+    note = "\n".join(["---", *front, "---", "", body, "", content, ""])
+    return note, {"title": title, "date": date_value, "type": note_type, "tags": tags}
+
+
+def next_available_path(vault: Path, relative: str) -> Tuple[str, Path]:
+    relative, target = safe_relative_path(vault, relative)
+    if not target.exists():
+        return relative, target
+    base = Path(relative)
+    number = 2
+    while True:
+        candidate = base.with_name(f"{base.stem}-{number}{base.suffix}").as_posix()
+        candidate_relative, candidate_target = safe_relative_path(vault, candidate)
+        if not candidate_target.exists():
+            return candidate_relative, candidate_target
+        number += 1
+
+
+def system_timestamp() -> str:
+    completed = subprocess.run(
+        ["/bin/date", "+%Y-%m-%d %H:%M:%S"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", value):
+        raise KiError("无法从系统 date 获取时间")
+    return value
+
+
+def insert_log(existing: str, timestamp: str, url: str, relative: str, action: str) -> str:
+    lines = existing.splitlines() if existing.strip() else LOG_HEADER.copy()
+    if lines and lines[0].strip() == "# 导入日志":
+        header_at = next(
+            (
+                i
+                for i, line in enumerate(lines)
+                if parse_markdown_row(line, 4) and "时间" in line and "来源 URL" in line
+            ),
+            None,
+        )
+        if header_at is not None:
+            if any(line.strip() for line in lines[1:header_at]):
+                raise KiError("_import-log.md 表头前包含未知内容，拒绝自动修复")
+            repaired = ["# 导入日志", "", lines[header_at]]
+            separator_seen = False
+            separator_re = re.compile(r"\|(?:\s*:?-{3,}:?\s*\|){4}")
+            for line in lines[header_at + 1 :]:
+                stripped = line.strip()
+                is_separator = bool(separator_re.fullmatch(stripped))
+                if not separator_seen and (not stripped or is_separator):
+                    if is_separator:
+                        separator_seen = True
+                        repaired.append("| --- | --- | --- | --- |")
+                    continue
+                if separator_seen and (not stripped or is_separator):
+                    continue
+                repaired.append(line)
+            if not separator_seen:
+                repaired.insert(header_at + 1, "| --- | --- | --- | --- |")
+            lines = repaired
+    if len(lines) < 4 or parse_markdown_row(lines[2], 4) is None:
+        raise KiError("_import-log.md 表头无效，拒绝破坏性重写")
+    row = f"| {timestamp} | {markdown_escape(url)} | [{relative}]({relative}) | {action} |"
+    data_indices: List[Tuple[int, str]] = []
+    for index, line in enumerate(lines[4:], 4):
+        if not line.strip():
+            continue
+        cells = parse_markdown_row(line, 4)
+        if cells is None:
+            raise KiError(f"_import-log.md 第 {index + 1} 行结构无效")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?", cells[0]):
+            raise KiError(f"_import-log.md 第 {index + 1} 行时间无效")
+        data_indices.append((index, cells[0]))
+    insert_at = len(lines)
+    for index, old_timestamp in data_indices:
+        if old_timestamp <= timestamp:
+            insert_at = index
+            break
+    lines.insert(insert_at, row)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def index_row(meta: Dict[str, Any], relative: str) -> str:
+    tags = " ".join(f"`{markdown_escape(tag)}`" for tag in meta["tags"])
+    title = markdown_escape(str(meta["title"]))
+    note_type = markdown_escape(str(meta["type"]))
+    insight = markdown_escape(str(meta["insight"]))
+    if len(insight) > 30:
+        raise KiError("核心洞察不得超过 30 个字符")
+    date_value = validate_iso_date(meta["article_date"], "article_date")
+    return f"| [{title}]({relative}) | {note_type} | {tags} | {insight} | {date_value} |"
+
+
+def update_index(existing: str, meta: Dict[str, Any], relative: str, today: str) -> str:
+    top = str(meta["top_level"]).strip()
+    second = str(meta["second_level"]).strip()
+    if not top or not second or any(ch in top + second for ch in "\n\r|"):
+        raise KiError("顶层和二级分类无效")
+    lines = existing.splitlines() if existing.strip() else ["# 知识索引", "", f"_最后更新：{today}_"]
+    update_re = re.compile(r"^_最后更新：\d{4}-\d{2}-\d{2}_$")
+    for index, line in enumerate(lines):
+        if update_re.match(line):
+            lines[index] = f"_最后更新：{today}_"
+            break
+    else:
+        lines.insert(1, "")
+        lines.insert(2, f"_最后更新：{today}_")
+
+    parts = Path(relative).parts
+    if parts and parts[0] == "知识库":
+        heading = "## " + " / ".join(parts[1:-1])
+    else:
+        heading = f"## {top} / {second}"
+    try:
+        section_start = lines.index(heading)
+    except ValueError:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend([heading, "", *INDEX_TABLE])
+        section_start = lines.index(heading)
+    section_end = len(lines)
+    for index in range(section_start + 1, len(lines)):
+        if lines[index].startswith("## "):
+            section_end = index
+            break
+    header_index = None
+    for index in range(section_start + 1, section_end):
+        if parse_markdown_row(lines[index], 5) and "文档" in lines[index] and "type" in lines[index]:
+            header_index = index
+            break
+    if header_index is None or header_index + 1 >= len(lines) or not lines[header_index + 1].startswith("|"):
+        raise KiError(f"知识索引 section 表头无效：{heading}")
+
+    row = index_row(meta, relative)
+    existing_path_pattern = re.compile(r"\]\(" + re.escape(relative) + r"\)")
+    # Step 7 of the original /ki contract inserts the latest imported or
+    # updated document immediately below the section header.  Remove any
+    # existing row for the same path first so append/force operations keep a
+    # single index entry while still moving that entry to the newest position.
+    existing_indices = [
+        index
+        for index in range(header_index + 2, section_end)
+        if existing_path_pattern.search(lines[index])
+    ]
+    for index in reversed(existing_indices):
+        del lines[index]
+    lines.insert(header_index + 2, row)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def atomic_write(path: Path, content: str, default_mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else default_mode
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_name)
+
+
+def lock_path(vault: Path) -> Path:
+    digest = hashlib.sha256(str(vault.resolve()).encode("utf-8")).hexdigest()[:20]
+    return Path(tempfile.gettempdir()) / f"ki-import-{digest}.lock"
+
+
+@contextlib.contextmanager
+def vault_lock(vault: Path):
+    path = lock_path(vault)
+    with (vault / ".unified-catalog.lock").open("a+", encoding="utf-8") as shared:
+        fcntl.flock(shared.fileno(), fcntl.LOCK_EX)
+        try:
+            with path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    if (vault / ".knowledge-migration-in-progress.json").exists():
+                        raise KiError("知识库正在迁移，请等待完成后重新导入")
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            fcntl.flock(shared.fileno(), fcntl.LOCK_UN)
+
+
+def snapshot(path: Path) -> Tuple[bool, bytes, int]:
+    if not path.exists():
+        return False, b"", 0o644
+    return True, path.read_bytes(), path.stat().st_mode & 0o777
+
+
+def restore(path: Path, state: Tuple[bool, bytes, int]) -> None:
+    existed, content, mode = state
+    if not existed:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.restore.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temp_name)
+
+
+def journal_path(vault: Path) -> Path:
+    return vault / ".ki-import-transaction.json"
+
+
+def missing_parent_dirs(path: Path, vault: Path) -> List[Path]:
+    missing: List[Path] = []
+    parent = path.parent
+    while parent != vault:
+        if not parent.exists():
+            missing.append(parent)
+        parent = parent.parent
+    return missing
+
+
+def write_journal(
+    vault: Path,
+    states: Dict[Path, Tuple[bool, bytes, int]],
+    created_dirs: Sequence[Path] = (),
+) -> Path:
+    payload = {
+        "version": 1,
+        "vault": str(vault.resolve()),
+        "states": [
+            {
+                "relative": path.relative_to(vault).as_posix(),
+                "existed": state[0],
+                "content_b64": base64.b64encode(state[1]).decode("ascii"),
+                "mode": state[2],
+            }
+            for path, state in states.items()
+        ],
+        "created_dirs": [path.relative_to(vault).as_posix() for path in created_dirs],
+    }
+    path = journal_path(vault)
+    atomic_write(path, json.dumps(payload, ensure_ascii=False) + "\n", 0o600)
+    return path
+
+
+def remove_created_dirs(vault: Path, relatives: Sequence[str]) -> None:
+    for relative in relatives:
+        candidate = Path(relative)
+        if candidate.is_absolute() or any(part in ("", ".", "..") for part in candidate.parts):
+            raise KiError("事务恢复日志包含非法目录")
+        parent = vault / candidate
+        try:
+            parent.rmdir()
+        except OSError:
+            continue
+
+
+def recover_journal(vault: Path) -> bool:
+    path = journal_path(vault)
+    if not path.exists():
+        return False
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("version") != 1 or payload.get("vault") != str(vault.resolve()):
+            raise KiError("事务恢复日志与当前 Vault 不匹配")
+        for item in reversed(payload.get("states", [])):
+            relative, target = safe_relative_path(vault, item["relative"])
+            state = (
+                bool(item["existed"]),
+                base64.b64decode(item["content_b64"], validate=True),
+                int(item["mode"]),
+            )
+            restore(target, state)
+        created_dirs = payload.get("created_dirs", [])
+        if not isinstance(created_dirs, list) or not all(isinstance(item, str) for item in created_dirs):
+            raise KiError("事务恢复日志 created_dirs 无效")
+        remove_created_dirs(vault, created_dirs)
+        path.unlink()
+        return True
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise KiError(f"事务恢复失败，已停止写入：{exc}") from exc
+
+
+def validate_analysis(meta: Dict[str, Any], current_url: str, notes_root: Optional[str] = None) -> Dict[str, Any]:
+    if meta.get("current_url") != current_url:
+        raise KiError("❌ 内部保护：检测到非输入 URL，已停止，未写入文件。")
+    if meta.get("action") not in ("new", "append"):
+        raise KiError("action 必须是 new 或 append")
+    for key in ("relative_path", "insight"):
+        if not isinstance(meta.get(key), str) or not str(meta[key]).strip():
+            raise KiError(f"{key} 不得为空")
+    meta["tags"] = validate_tags(meta.get("tags"))
+    relative = Path(str(meta["relative_path"]))
+    top = validate_single_line(meta.get("top_level"), "top_level")
+    second = validate_single_line(meta.get("second_level"), "second_level")
+    if "|" in top or "|" in second:
+        raise KiError("top_level/second_level 含 Markdown 表格非法字符")
+    if len(relative.parts) < 3:
+        raise KiError("relative_path 至少包含顶层、二级目录和文件名")
+    prefix = (notes_root,) if notes_root else ()
+    if tuple(relative.parts[:len(prefix)]) != prefix or len(relative.parts) < len(prefix) + 3:
+        raise KiError("relative_path 未位于统一知识目录")
+    if relative.parts[len(prefix)] != top or relative.parts[len(prefix) + 1] != second:
+        raise KiError("relative_path 与 top_level/second_level 不一致")
+    if notes_root:
+        from topic_taxonomy import validate_category
+        try:
+            validate_category(list(relative.parts[1:-1]))
+        except ValueError as exc:
+            raise KiError(str(exc)) from exc
+    validate_single_line(meta.get("title"), "title")
+    validate_single_line(meta.get("type"), "type")
+    if len(str(meta["insight"]).strip()) > 30:
+        raise KiError("核心洞察不得超过 30 个字符")
+    return meta
+
+
+def command_commit(args: argparse.Namespace) -> None:
+    plan = read_bound_plan(
+        args.plan_file,
+        output=args.output,
+        output_key="commit_dry_file" if args.dry_run else "commit_file",
+        inputs={
+            "analysis_file": args.analysis_file,
+            "body_file": args.body_file,
+        },
+    )
+    if plan.get("status") != "ok" or plan.get("mode") != "single":
+        raise KiError("commit 只接受成功的单条 plan")
+    current_url = str(plan.get("current_url", ""))
+    vault = vault_path(args.vault)
+    meta = validate_analysis(read_json(args.analysis_file), current_url, configured_notes_root(vault))
+    body = Path(args.body_file).read_text(encoding="utf-8")
+    timestamp = args.timestamp or system_timestamp()
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", timestamp):
+        raise KiError("timestamp 格式无效")
+    today = timestamp[:10]
+    unified_only = configured_unified_only(vault)
+    log_path = vault / ("导入总日志.md" if unified_only else "_import-log.md")
+    index_path = vault / ("知识总索引.md" if unified_only else "_knowledge-index.md")
+
+    with vault_lock(vault):
+        recovered = recover_journal(vault)
+        duplicate = (unified_store_module().find_ki_url(vault, current_url) if unified_only
+                     else find_log_url(log_path, current_url))
+        force = args.force or plan.get("force") is True
+        if duplicate is not None and not force:
+            emit({
+                "status": "duplicate",
+                "path": duplicate,
+                "message": f"已存在：{duplicate}（回复“更新”可覆盖）",
+            }, args.output)
+            return
+
+        action = str(meta["action"])
+        if action == "new":
+            requested_relative = str(meta["relative_path"])
+            if force and duplicate is not None:
+                if requested_relative != duplicate:
+                    raise KiError("强制覆盖路径必须与导入日志中的原路径完全一致")
+                relative, note_path = safe_relative_path(vault, duplicate)
+                if not note_path.is_file():
+                    raise KiError(f"强制覆盖目标不存在：{relative}")
+            else:
+                relative, note_path = next_available_path(vault, requested_relative)
+            note_content = build_new_note(meta, current_url, today, validate_body(body))
+            index_meta = {
+                **meta,
+                "article_date": validate_iso_date(meta["article_date"], "article_date"),
+            }
+        else:
+            relative, note_path = safe_relative_path(vault, str(meta["relative_path"]))
+            if force and duplicate is not None and relative != duplicate:
+                raise KiError("强制覆盖路径必须与导入日志中的原路径完全一致")
+            if not note_path.exists():
+                raise KiError(f"追加目标不存在：{relative}")
+            if re.search(r"(?m)^aweme_id:\s*", note_path.read_text(encoding="utf-8")[:2000]):
+                raise KiError("不能用 KI 追加 DY 作品笔记；请新建关联主题笔记")
+            note_content, original = update_append_note(
+                note_path.read_text(encoding="utf-8"),
+                current_url,
+                today,
+                meta["tags"],
+                body,
+            )
+            parts = Path(relative).parts
+            if len(parts) < 3:
+                raise KiError("追加目标路径不足以确定顶层/二级分类")
+            index_meta = {
+                **meta,
+                "title": original["title"],
+                "article_date": original["date"],
+                "type": original["type"],
+                "tags": original["tags"],
+                "top_level": parts[1] if configured_notes_root(vault) else parts[0],
+                "second_level": parts[2] if configured_notes_root(vault) else parts[1],
+            }
+
+        operation = "append" if action == "append" else "update" if force and duplicate is not None else "new"
+        table_action = {"new": "新建", "update": "更新", "append": "追加"}[operation]
+        if unified_only:
+            index_meta["author_name"] = article_author_name(plan)
+            catalog_changes = unified_store_module().ki_changes(
+                vault, index_meta, relative, timestamp, current_url, table_action)
+            log_content = catalog_changes[log_path].decode("utf-8")
+            index_content = catalog_changes[index_path].decode("utf-8")
+        else:
+            log_existing = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+            index_existing = index_path.read_text(encoding="utf-8") if index_path.exists() else ""
+            log_content = insert_log(log_existing, timestamp, current_url, relative, table_action)
+            index_content = update_index(index_existing, index_meta, relative, today)
+
+        if args.dry_run:
+            emit({
+                "status": "ok",
+                "dry_run": True,
+                "action": action,
+                "operation": operation,
+                "path": relative,
+                "timestamp": timestamp,
+            }, args.output)
+            return
+
+        paths = [note_path, log_path, index_path]
+        states = {path: snapshot(path) for path in paths}
+        created_dirs = missing_parent_dirs(note_path, vault)
+        transaction_journal = write_journal(vault, states, created_dirs)
+        try:
+            atomic_write(note_path, note_content, 0o644)
+            if os.environ.get("KI_FAIL_AFTER_REPLACE") == "note":
+                raise OSError("injected failure after note")
+            atomic_write(log_path, log_content, 0o600)
+            if os.environ.get("KI_FAIL_AFTER_REPLACE") == "log":
+                raise OSError("injected failure after log")
+            atomic_write(index_path, index_content, 0o600)
+            if os.environ.get("KI_FAIL_AFTER_REPLACE") == "index":
+                raise OSError("injected failure after index")
+        except BaseException:
+            for path in reversed(paths):
+                restore(path, states[path])
+            remove_created_dirs(vault, [path.relative_to(vault).as_posix() for path in created_dirs])
+            with contextlib.suppress(FileNotFoundError):
+                transaction_journal.unlink()
+            raise
+        transaction_journal.unlink()
+
+        table = (
+            f"{table_action}：\n"
+            f"| {timestamp[:16]} | {current_url} | [{relative}]({relative}) | {table_action} |"
+        )
+        committed = {
+            "status": "ok",
+            "action": action,
+            "operation": operation,
+            "path": relative,
+            "message": f"✅ {'新增' if operation == 'new' else '更新'}成功：{relative}" + ("（追加内容）" if operation == "append" else ""),
+            "timestamp": timestamp,
+            "recovered_previous_transaction": recovered,
+            "table": table,
+        }
+
+    warning = None if unified_only else sync_unified_catalog(vault)
+    if warning:
+        committed["unified_sync_warning"] = warning
+        committed["message"] += "（笔记已写入；总索引/总日志同步失败，可运行 unified_catalog.py rebuild 重建）"
+    emit(committed, args.output)
+
+
+def isolated_artifacts(payload: Dict[str, Any]) -> Dict[str, str]:
+    run_dir = payload.get("run_dir")
+    if not isinstance(run_dir, str) or not Path(run_dir).is_absolute():
+        raise KiError("必须先 init，使用本次独立运行目录")
+    expected = run_artifacts(Path(run_dir).resolve())
+    if payload.get("artifacts") != expected:
+        raise KiError("运行文件清单与本次独立目录不一致，请重新 init")
+    return expected
+
+
+def cleanup_success_run(plan: Dict[str, Any], artifacts: Dict[str, str]) -> None:
+    """Remove this run's private temporary directory after a confirmed commit."""
+    run_dir = Path(str(plan["run_dir"]))
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if (
+        run_dir.parent != temp_root
+        or not run_dir.name.startswith("ki-run-")
+        or run_dir.is_symlink()
+        or not run_dir.is_dir()
+        or run_dir.resolve() != run_dir
+        or run_dir.stat().st_uid != os.getuid()
+        or run_dir.stat().st_mode & 0o777 != 0o700
+    ):
+        raise KiError("临时目录身份不符，未清理")
+    allowed_names = {".ki-run.json", *RUN_ARTIFACT_NAMES.values()}
+    entries = list(run_dir.iterdir())
+    if any(
+        entry.name not in allowed_names or entry.is_symlink() or not entry.is_file()
+        for entry in entries
+    ):
+        raise KiError("临时目录含有未知或非普通文件，未清理")
+    marker_path = run_dir / ".ki-run.json"
+    marker = read_json(str(marker_path))
+    if (
+        marker.get("run_id") != run_dir.name
+        or marker.get("run_dir") != str(run_dir)
+        or marker.get("artifacts") != artifacts
+        or artifacts != run_artifacts(run_dir)
+    ):
+        raise KiError("临时目录清单不一致，未清理")
+    for entry in entries:
+        if entry != marker_path:
+            entry.unlink()
+    marker_path.unlink()
+    run_dir.rmdir()
+
+
+def saved_step(handler: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Keep full evidence on disk; don't repeat each step's metadata to the model."""
+    with contextlib.redirect_stdout(io.StringIO()):
+        handler(argparse.Namespace(**kwargs))
+    return read_json(kwargs["output"])
+
+
+def workflow_error(stage: str, exc: Exception, output: Optional[str]) -> int:
+    detail = str(exc)
+    reason = " ".join(normalize_text(detail).split())
+    message = f"❌ 失败【{stage}】：{reason[:160]}" + ("…" if len(reason) > 160 else "")
+    payload = {"status": "error", "stage": stage, "message": message, "detail": detail}
+    emit(payload, output, view={key: payload[key] for key in ("status", "stage", "message")})
+    return 2 if isinstance(exc, KiError) else 1
+
+
+def command_prepare(args: argparse.Namespace) -> int:
+    """Plan, check duplicates, then fetch (or schedule) in one deterministic call."""
+    stage, output = "参数校验", None
+    try:
+        input_path = Path(args.input_file).expanduser().resolve()
+        artifacts = isolated_artifacts(read_json(str(input_path.parent / ".ki-run.json")))
+        if str(input_path) != artifacts["raw_file"]:
+            raise KiError("输入未使用 init 分配的 raw_file")
+        output = artifacts["prepare_file"]
+        plan = saved_step(command_plan, input_file=str(input_path), output=artifacts["plan_file"])
+        if plan.get("status") != "ok":
+            raise KiError(plan["message"])
+        if plan["mode"] == "batch":
+            stage = "排队"
+            scheduled = saved_step(command_schedule, plan_file=artifacts["plan_file"],
+                                   output=artifacts["schedule_file"], cc_connect=args.cc_connect,
+                                   timeout=args.timeout)
+            emit({"status": "queued", "scheduled": scheduled["scheduled"],
+                  "message": scheduled["message"]}, output)
+            return 0
+        stage = "查重"
+        lookup = saved_step(command_lookup, plan_file=artifacts["plan_file"],
+                            output=artifacts["lookup_file"], vault=args.vault)
+        if lookup["duplicate"] and not lookup.get("bypass"):
+            emit({"status": "duplicate", "path": lookup["path"], "message": lookup["message"]}, output)
+            return 0
+        stage = "抓取"
+        article = saved_step(command_fetch, plan_file=artifacts["plan_file"],
+                             output=artifacts["article_file"], timeout=args.timeout,
+                             jina_base=args.jina_base)
+        emit({"status": "ready", "current_url": plan["current_url"],
+              "force": plan.get("force", False), "existing_path": lookup.get("path"),
+              "title": article["title"], "article_date": article["article_date"],
+              "article_text": article["article_text"]}, output)
+        return 0
+    except Exception as exc:
+        return workflow_error(stage, exc, output)
+
+
+def command_finish(args: argparse.Namespace) -> int:
+    """Validate, then commit with the existing lock, duplicate check and rollback."""
+    stage, output = "提交校验", None
+    try:
+        plan = read_bound_plan(args.plan_file)
+        artifacts = isolated_artifacts(plan)
+        output = artifacts["finish_file"]
+        common = dict(plan_file=args.plan_file, analysis_file=artifacts["analysis_file"],
+                      body_file=artifacts["body_file"], vault=args.vault,
+                      timestamp=None, force=False)
+        result = saved_step(command_commit, **common, dry_run=True, output=artifacts["commit_dry_file"])
+        if result["status"] != "duplicate":
+            stage = "写入"
+            result = saved_step(command_commit, **common, dry_run=False, output=artifacts["commit_file"])
+        view = {key: result[key] for key in ("status", "operation", "path", "message", "unified_sync_warning") if key in result}
+        if result["status"] == "ok":
+            try:
+                cleanup_success_run(plan, artifacts)
+            except Exception as exc:
+                view["temporary_cleanup_error"] = str(exc)
+                view["message"] += "（笔记已写入，但临时目录清理失败）"
+                emit(view, output if Path(output).parent.is_dir() else None)
+            else:
+                emit(view)
+        else:
+            emit(view, output)
+        return 0
+    except Exception as exc:
+        return workflow_error(stage, exc, output)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init = sub.add_parser("init", help="allocate an isolated artifact directory for one /ki run")
+    init.set_defaults(handler=command_init)
+
+    prepare = sub.add_parser("prepare", help="plan, deduplicate and fetch; return only analysis inputs")
+    prepare.add_argument("--input-file", required=True)
+    prepare.add_argument("--vault", default=configured_vault())
+    prepare.add_argument("--cc-connect")
+    prepare.add_argument("--timeout", type=int, default=30)
+    prepare.add_argument("--jina-base", default=os.environ.get("KI_JINA_BASE", "https://r.jina.ai"))
+    prepare.set_defaults(handler=command_prepare)
+
+    finish = sub.add_parser("finish", help="dry-run and atomic commit; return a concise result")
+    finish.add_argument("--plan-file", required=True)
+    finish.add_argument("--vault", default=configured_vault())
+    finish.set_defaults(handler=command_finish)
+
+    plan = sub.add_parser("plan", help="freeze URLs from raw /ki arguments")
+    plan.add_argument("--input-file", required=True)
+    plan.add_argument("--output")
+    plan.set_defaults(handler=command_plan)
+
+    schedule = sub.add_parser("schedule", help="create one safe timer per batch URL")
+    schedule.add_argument("--plan-file", required=True)
+    schedule.add_argument("--cc-connect")
+    schedule.add_argument("--timeout", type=int, default=30)
+    schedule.add_argument("--output")
+    schedule.set_defaults(handler=command_schedule)
+
+    lookup = sub.add_parser("lookup", help="check exact CURRENT_URL in the import log")
+    lookup.add_argument("--plan-file", required=True)
+    lookup.add_argument("--vault", default=configured_vault())
+    lookup.add_argument("--output")
+    lookup.set_defaults(handler=command_lookup)
+
+    fetch = sub.add_parser("fetch", help="fetch CURRENT_URL without a shell")
+    fetch.add_argument("--plan-file", required=True)
+    fetch.add_argument("--timeout", type=int, default=30)
+    fetch.add_argument("--jina-base", default=os.environ.get("KI_JINA_BASE", "https://r.jina.ai"))
+    fetch.add_argument("--output")
+    fetch.set_defaults(handler=command_fetch)
+
+    scan = sub.add_parser("scan", help="rank similarity candidates from the first 60 lines")
+    scan.add_argument("--vault", default=configured_vault())
+    scan.add_argument("--plan-file")
+    scan.add_argument("--domain", choices=("ai", "tools", "system", "all"), required=True)
+    scan.add_argument("--terms-file", required=True)
+    scan.add_argument("--limit", type=int, default=20)
+    scan.add_argument("--excerpt-chars", type=int, default=800)
+    scan.add_argument("--output")
+    scan.add_argument("--compact", action="store_true", help="show six short candidates; keep full result on disk")
+    scan.set_defaults(handler=command_scan)
+
+    commit = sub.add_parser("commit", help="transactionally write note, log, and index")
+    commit.add_argument("--plan-file", required=True)
+    commit.add_argument("--analysis-file", required=True)
+    commit.add_argument("--body-file", required=True)
+    commit.add_argument("--vault", default=configured_vault())
+    commit.add_argument("--timestamp", help="test-only deterministic timestamp")
+    commit.add_argument("--force", action="store_true")
+    commit.add_argument("--dry-run", action="store_true")
+    commit.add_argument("--output")
+    commit.set_defaults(handler=command_commit)
+    return parser
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        result = args.handler(args)
+        return result if isinstance(result, int) else 0
+    except KiError as exc:
+        sys.stderr.write(f"ERROR: {exc}\n")
+        return 2
+    except Exception as exc:
+        sys.stderr.write(f"ERROR: {type(exc).__name__}: {exc}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
