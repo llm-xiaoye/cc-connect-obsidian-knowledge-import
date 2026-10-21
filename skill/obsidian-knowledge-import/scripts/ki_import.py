@@ -49,19 +49,6 @@ def configured_vault() -> str:
     return "~/Documents/obsidian"
 
 
-def configured_unified_dy_vault(vault: Path) -> Optional[Path]:
-    """The shared view is opt-in so isolated/test vaults keep their old behavior."""
-    config_path = Path.cwd() / ".claude" / "ki-config.json"
-    if not config_path.is_file():
-        return None
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(config, dict) or not isinstance(config.get("unified_dy_vault"), str):
-        return None
-    if Path(config.get("vault", "")).expanduser().resolve() != vault.resolve():
-        return None
-    return Path(config["unified_dy_vault"]).expanduser().resolve()
-
-
 def configured_notes_root(vault: Path) -> Optional[str]:
     config_path = Path.cwd() / ".claude" / "ki-config.json"
     if not config_path.is_file():
@@ -87,24 +74,6 @@ def unified_store_module():
     return unified_store
 
 
-def sync_unified_catalog(vault: Path) -> Optional[str]:
-    """Run after the KI transaction; a view failure never rolls back an import."""
-    try:
-        dy_vault = configured_unified_dy_vault(vault)
-        if dy_vault is None:
-            return None
-        script = Path(__file__).resolve().parent / "unified_catalog.py"
-        result = subprocess.run(
-            [sys.executable, "-B", str(script), "rebuild", "--vault", str(vault), "--dy-vault", str(dy_vault)],
-            capture_output=True, text=True, timeout=120,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-        )
-        payload = json.loads(result.stdout)
-        if result.returncode or payload.get("status") != "ok":
-            return str(payload.get("message") or result.stderr.strip() or "未知错误")[:300]
-        return None
-    except (OSError, ValueError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
-        return str(exc)[:300]
 BLOCKED_EXTENSIONS = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mp3", ".zip", ".pdf"
 )
@@ -1012,7 +981,6 @@ def command_scan(args: argparse.Namespace) -> None:
         for path in root.rglob("*.md"):
             if path.relative_to(vault).as_posix() in {
                 "_import-log.md", "_knowledge-index.md", "知识总索引.md", "导入总日志.md",
-                "DY-知识索引.md", "DY-更新日志.md",
             }:
                 continue
             try:
@@ -1223,6 +1191,8 @@ def update_append_note(
     sources = unique_in_order(previous_sources + ([legacy_url] if legacy_url else []) + [current_url])
     tags = unique_in_order(parse_yaml_list(front, "tags") + list(new_tags))
     original_url = parse_yaml_scalar(front, "source_url")
+    if not any(value.startswith(("https://", "http://")) for value in [original_url, legacy_url, *previous_sources]):
+        raise KiError("追加目标缺少已有网页来源，请新建关联主题笔记")
     if not original_url.startswith(("https://", "http://")):
         original_url = next((url for url in previous_sources if url.startswith(("https://", "http://"))), legacy_url or current_url)
     front = replace_yaml_field(front, "source_url", [f"source_url: {yaml_quote(original_url)}"])
@@ -1625,8 +1595,6 @@ def command_commit(args: argparse.Namespace) -> None:
                 raise KiError("强制覆盖路径必须与导入日志中的原路径完全一致")
             if not note_path.exists():
                 raise KiError(f"追加目标不存在：{relative}")
-            if re.search(r"(?m)^aweme_id:\s*", note_path.read_text(encoding="utf-8")[:2000]):
-                raise KiError("不能用 KI 追加 DY 作品笔记；请新建关联主题笔记")
             note_content, original = update_append_note(
                 note_path.read_text(encoding="utf-8"),
                 current_url,
@@ -1710,10 +1678,6 @@ def command_commit(args: argparse.Namespace) -> None:
             "table": table,
         }
 
-    warning = None if unified_only else sync_unified_catalog(vault)
-    if warning:
-        committed["unified_sync_warning"] = warning
-        committed["message"] += "（笔记已写入；总索引/总日志同步失败，可运行 unified_catalog.py rebuild 重建）"
     emit(committed, args.output)
 
 

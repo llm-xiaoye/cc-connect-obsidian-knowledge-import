@@ -119,10 +119,7 @@ class QuietWorkflowTests(unittest.TestCase):
         self.assertEqual(repeated["path"], relative)
 
     def test_unified_only_writes_the_two_visible_catalogs(self):
-        import sys
-        scripts = Path(__file__).resolve().parents[2] / "douyin-to-obsidian" / "scripts"
-        sys.path.insert(0, str(scripts))
-        import unified_store
+        unified_store = ki.unified_store_module()
         (self.vault / unified_store.INDEX_NAME).write_bytes(unified_store.render_index([]))
         (self.vault / unified_store.LOG_NAME).write_bytes(unified_store.render_log([]))
         relative = "知识库/AI/大模型/推理与成本/长上下文/有效上下文.md"
@@ -160,10 +157,7 @@ class QuietWorkflowTests(unittest.TestCase):
         self.assertFalse((self.vault / "_import-log.md").exists())
 
     def test_unified_only_failed_log_write_restores_totals_and_note(self):
-        scripts = Path(__file__).resolve().parents[2] / "douyin-to-obsidian" / "scripts"
-        import sys
-        sys.path.insert(0, str(scripts))
-        import unified_store
+        unified_store = ki.unified_store_module()
         totals = {self.vault / unified_store.INDEX_NAME: unified_store.render_index([]),
                   self.vault / unified_store.LOG_NAME: unified_store.render_log([])}
         for path, content in totals.items():
@@ -184,21 +178,23 @@ class QuietWorkflowTests(unittest.TestCase):
         self.assertEqual({path: path.read_bytes() for path in totals}, totals)
         self.assertFalse((self.vault / meta["relative_path"]).exists())
 
-    def test_unified_view_failure_keeps_successful_import(self):
+    def test_legacy_import_writes_only_its_configured_vault(self):
+        unrelated = self.root / "unrelated-vault"
+        unrelated.mkdir()
+        marker = unrelated / "keep.md"
+        marker.write_text("unrelated user content", encoding="utf-8")
         artifacts = self.new_run()
         self.assertEqual(self.prepare(artifacts)[0], 0)
         self.draft(artifacts)
-        with patch.object(ki, "sync_unified_catalog", return_value="synthetic view failure"):
-            code, result = self.finish(artifacts)
+        code, result = self.finish(artifacts)
         self.assertEqual((code, result["status"]), (0, "ok"))
-        self.assertEqual(result["unified_sync_warning"], "synthetic view failure")
-        self.assertIn("总索引/总日志同步失败", result["message"])
+        self.assertNotIn("unified_sync_warning", result)
         self.assertTrue((self.vault / RELATIVE).is_file())
+        self.assertEqual(marker.read_text(encoding="utf-8"), "unrelated user content")
 
     def test_scan_ignores_both_source_and_unified_catalogs(self):
         marker = "only-catalog-marker"
-        for name in ("知识总索引.md", "导入总日志.md", "_knowledge-index.md", "_import-log.md",
-                     "DY-知识索引.md", "DY-更新日志.md"):
+        for name in ("知识总索引.md", "导入总日志.md", "_knowledge-index.md", "_import-log.md"):
             (self.vault / name).write_text(marker)
         terms = self.root / "terms.txt"
         terms.write_text(marker)
@@ -336,6 +332,13 @@ class QuietWorkflowTests(unittest.TestCase):
         self.assertIn(f"source_url: {ki.yaml_quote(URL)}", updated)
         self.assertIn(f"  - {ki.yaml_quote(URL)}", updated)
         self.assertIn(f"  - {ki.yaml_quote(URL_TWO)}", updated)
+
+    def test_append_requires_an_existing_web_source(self):
+        unrelated = "\n".join(["---", "title: Personal note", "date: 2026-09-19",
+                                 "type: 观点", "---", "", "保留原始内容", ""])
+        with self.assertRaisesRegex(ki.KiError, "网页来源"):
+            ki.update_append_note(unrelated, URL_TWO, "2026-10-21", ["web"],
+                                  "## 补充 2026-10-21\n\n### 新增要点\n网页证据\n")
 
     def test_invalid_draft_never_reaches_actual_commit(self):
         artifacts = self.new_run()

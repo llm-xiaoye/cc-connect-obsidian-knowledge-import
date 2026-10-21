@@ -36,7 +36,7 @@ workspace 和 Vault 必须已存在。安装器在 workspace/.claude/ 中安装�
 
 默认使用统一模式：笔记在知识库/主题目录，根目录维护知识总索引.md 和导入总日志.md。空 Vault 自动创建两份空总览；已有正确总览直接使用。非空 Vault 缺少总览时停止，不自动迁移笔记。
 
-v1.0 用户继续原来的分离索引布局，可在 install 后追加 --legacy-layout。该模式继续使用 _import-log.md、_knowledge-index.md 和原主题目录；安装器会生成对应说明。既有配置中的其他键保留，可选 unified_dy_vault 仍被支持。
+v1.0 用户继续原来的分离索引布局，可在 install 后追加 --legacy-layout。该模式继续使用 _import-log.md、_knowledge-index.md 和原主题目录；安装器会生成对应说明。
 
 ## 使用
 
@@ -65,8 +65,8 @@ skill/obsidian-knowledge-import/
   scripts/ki_import.py            确定性导入流程
   scripts/auto_route.py           微信自动路由
   scripts/unified_store.py        统一索引与日志
-  scripts/unified_catalog.py      总览检查和兼容操作
-  scripts/review_log.py           共享日志辅助
+  scripts/unified_catalog.py      索引与日志的只读一致性检查
+  scripts/unified_store.py        笔记索引和导入日志的事务更新
   scripts/topic_taxonomy.py       主题分类规则
 scripts/manage.py                安装、检查和卸载
 tests/                           抓取、写入、路由和安装回归

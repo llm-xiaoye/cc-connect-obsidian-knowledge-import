@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
-"""KI/DY's two visible Markdown catalogs as their shared source of truth."""
+"""Read and update webpage knowledge notes and import history."""
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path, PurePosixPath
 import re
 from urllib.parse import quote, unquote
-
-import review_log
 
 INDEX_NAME = "知识总索引.md"
 LOG_NAME = "导入总日志.md"
@@ -23,15 +20,6 @@ def log_row(row: list[str]) -> list[str]:
     if len(row) != len(LOG_HEADERS):
         raise ValueError("导入总日志行列数无效")
     return list(row)
-
-
-def verified_author_name(front: dict) -> str:
-    sec_uid, name = front.get("douyin_author_id"), front.get("douyin_author")
-    if not isinstance(sec_uid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,120}", sec_uid):
-        return ""
-    if not isinstance(name, str) or not name.strip() or name.strip() == sec_uid[:12]:
-        return ""
-    return name.strip()
 
 
 def cells(line: str, expected: int) -> list[str]:
@@ -118,7 +106,7 @@ def _read_log(raw: str) -> list[list[str]]:
     lines = raw.splitlines()
     if not lines or lines[0] != "# 导入总日志":
         raise ValueError("导入总日志标题无效")
-    declared = re.search(r"^共 (\d+) 条：KI (\d+) 条，DY (\d+) 条。", raw, re.M)
+    declared = re.search(r"^共 (\d+) 条(?:[：。].*)?$", raw, re.M)
     if not declared:
         raise ValueError("导入总日志计数缺失")
     header, rows = None, []
@@ -134,7 +122,7 @@ def _read_log(raw: str) -> list[list[str]]:
                 if not header or len(row) != len(header):
                     raise ValueError("导入总日志分隔行位置无效")
             else:
-                if not header or len(row) != len(header) or row[1] not in ("KI", "DY") or not re.match(r"^\d{4}-\d{2}-\d{2}", row[0]):
+                if not header or len(row) != len(header) or not row[1] or not re.match(r"^\d{4}-\d{2}-\d{2}", row[0]):
                     raise ValueError("导入总日志事件结构无效")
                 # Two historical rows have no live note link. Keep their cells verbatim.
                 if row[3].startswith("["):
@@ -142,7 +130,7 @@ def _read_log(raw: str) -> list[list[str]]:
                 rows.append(log_row(row))
         elif line and not (line.startswith("共 ") or line.startswith("原始记录：") or line.startswith("其中 ")):
             raise ValueError("导入总日志包含未识别的正文，未覆盖")
-    if (len(rows), sum(row[1] == "KI" for row in rows), sum(row[1] == "DY" for row in rows)) != tuple(map(int, declared.groups())):
+    if len(rows) != int(declared.group(1)):
         raise ValueError("导入总日志事件计数不符")
     return rows
 
@@ -170,9 +158,8 @@ def render_index(rows: list[dict]) -> bytes:
 
 def render_log(rows: list[list[str]]) -> bytes:
     rows = [log_row(row) for row in rows]
-    ki_count = sum(row[1] == "KI" for row in rows)
     lines = ["# 导入总日志", "",
-             f"共 {len(rows)} 条：KI {ki_count} 条，DY {len(rows) - ki_count} 条。按时间由近到远排列。", "",
+             f"共 {len(rows)} 条。按时间由近到远排列。", "",
              "| " + " | ".join(LOG_HEADERS) + " |", "| " + " | ".join(["---"] * len(LOG_HEADERS)) + " |"]
     for row in sorted(rows, key=lambda item: item[0], reverse=True):
         lines.append("| " + " | ".join(row) + " |")
@@ -210,84 +197,10 @@ def ki_changes(vault: Path, meta: dict, relative: str, timestamp: str, url: str,
     return {vault / INDEX_NAME: index_raw, vault / LOG_NAME: log_raw}
 
 
-def dy_changes(vault: Path, config: dict, changes: dict, events: list[dict],
-               dy_rows: list[dict], moves: dict[str, str] | None = None) -> tuple[Path, Path]:
-    index, logs = load(vault)
-    moves = moves or {}
-    if moves:
-        old_paths = {old + ".md" for old in moves}
-        index = [row for row in index if row["path"] not in old_paths]
-        for row in logs:
-            old = link_path(row[3])
-            if row[1] == "DY" and old and old.removesuffix(".md") in moves:
-                new = moves[old.removesuffix(".md")] + ".md"
-                row[3] = note_link(link_title(row[3]), new)
-                row[4] = escape(topic(new))
-    by_path = {row["path"]: row for row in dy_rows}
-    index = [row for row in index if row["path"] not in by_path]
-    for row in dy_rows:
-        relative = row["path"]
-        fields = [note_link(row.get("title", Path(relative).stem), relative),
-                  escape(row.get("type", "知识笔记")),
-                  escape("、".join(row.get("tags", []))),
-                  escape(row.get("insight", "")),
-                  escape(review_log.display_time(row.get("created")))]
-        index.append({"path": relative, "cells": fields})
-
-    state_path = vault / config.get("review_state_file", review_log.STATE_FILE)
-    state = review_log.load_state(state_path, changes)
-    for row in dy_rows:
-        state["items"].setdefault(row["aweme_id"], {"initial_status": "未登记"})
-    for event in events:
-        row = by_path[event["path"]]
-        item = state["items"][row["aweme_id"]]
-        if event["action"] == "新增":
-            item["initial_status"] = "未复审"
-        if event.get("source_url"):
-            item["source_url"] = review_log.source_url(event["source_url"], row["aweme_id"])
-    current = {}
-    for row in dy_rows:
-        item = state["items"][row["aweme_id"]]
-        if not item.get("source_url"):
-            item["source_url"] = review_log.cached_source(config, row["aweme_id"])
-        review = item.get("review")
-        status, reviewed_at = item["initial_status"], "—"
-        if review:
-            path = vault / row["path"]
-            raw = changes[path] if path in changes else path.read_bytes()
-            status = review["outcome"] if hashlib.sha256(raw).hexdigest() == review["note_sha256"] else "修改后待复审"
-            reviewed_at = review_log.display_time(review["reviewed_at"])
-        current[row["path"]] = (item.get("source_url"),
-                                status + (f"（{reviewed_at}）" if reviewed_at != "—" else ""))
-    encoded_state = review_log.encode_state(state)
-    if not state_path.exists() or state_path.read_bytes() != encoded_state:
-        changes[state_path] = encoded_state
-    for row in logs:
-        relative = link_path(row[3]) if row[1] == "DY" else None
-        if relative in current:
-            url, review = current[relative]
-            row[5] = f"[原作品]({url})" if url else "—"
-            row[6] = review
-    for event in events:
-        relative = event["path"]
-        url, review = current[relative]
-        logs.append([review_log.display_time(event["time"]), "DY", escape(event["action"]),
-                     note_link(event["title"], relative), escape(topic(relative)),
-                     f"[原作品]({url})" if url else "—", review,
-                     escape(verified_author_name(by_path[relative]))])
-
-    index_raw, log_raw = render_index(index), render_log(logs)
-    validate_rendered(index_raw, log_raw, len(index), len(logs))
-    index_path, log_path = vault / INDEX_NAME, vault / LOG_NAME
-    changes[index_path], changes[log_path] = index_raw, log_raw
-    return index_path, log_path
-
-
 def check(vault: Path) -> dict:
     index, logs = load(vault)
     missing = sum(not (vault / row["path"]).is_file() for row in index)
     return {"status": "ok", "changed": False, "index_count": len(index),
-            "log_count": len(logs), "ki_log_count": sum(row[1] == "KI" for row in logs),
-            "dy_log_count": sum(row[1] == "DY" for row in logs),
+            "log_count": len(logs),
             "missing_index_notes": missing, "index": str(vault / INDEX_NAME),
             "log": str(vault / LOG_NAME)}

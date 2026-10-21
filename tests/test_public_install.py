@@ -72,7 +72,7 @@ class PublicInstallTests(unittest.TestCase):
         self.install()
         scripts = self.workspace / ".claude/skills/obsidian-knowledge-import/scripts"
         env = {**os.environ, "PYTHONPATH": str(scripts)}
-        source = "import json,unified_store,review_log,topic_taxonomy;print(json.dumps([m.__file__ for m in (unified_store,review_log,topic_taxonomy)]))"
+        source = "import json,unified_store,unified_catalog,topic_taxonomy;print(json.dumps([m.__file__ for m in (unified_store,unified_catalog,topic_taxonomy)]))"
         result = subprocess.run([sys.executable, "-B", "-c", source], cwd=self.workspace,
             env=env, text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)

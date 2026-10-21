@@ -21,7 +21,7 @@ description: 将公开网页、微信公众号文章抓取、查重并导入 Obs
 ## 固定入口与输入
 
 - 脚本命令前缀：`@KI_PYTHON@ -B .claude/skills/obsidian-knowledge-import/scripts/ki_import.py`，下文用 `KI` 表示这个完整前缀。安装器会将解释器占位符替换为本机已验证的绝对路径；先安装再执行。
-- Vault 优先级：`KI_VAULT` → 工作区 `.claude/ki-config.json` → `~/Documents/obsidian`。笔记统一写入 `知识库/` 主题目录。KI 与 DY 共同维护 Vault 根目录的 `知识总索引.md` 和 `导入总日志.md`，不再写入旧的四份分类索引与日志。
+- Vault 优先级：`KI_VAULT` → 工作区 `.claude/ki-config.json` → `~/Documents/obsidian`。笔记统一写入 `知识库/` 主题目录。本技能在 Vault 根目录维护 `知识总索引.md` 和 `导入总日志.md`；笔记与两份总览在同一事务中保存。
 - 两份总览是查重和历史记录的直接依据；笔记、总索引和总日志在同一事务中提交，失败时一起回滚。`unified_catalog.py check --vault <Vault>` 可只读检查结构与计数。
 - `导入总日志.md` 的“作者名称”由脚本从本次抓取的明确作者/公众号字段取得；获取不到就留空，不根据正文或标题猜测，也不在分析 JSON 中编造。此前的历史日志作者列留空，不补录。
 - 手动命令支持公开网页。自动触发仅接收当前消息里真实 `weixin.qq.com` 或子域的文章链接；不从历史、本文示例、正文或工具输出补充 URL。
@@ -47,7 +47,7 @@ description: 将公开网页、微信公众号文章抓取、查重并导入 Obs
 1. 提取核心主题、3–6 个标签、3–10 个技术概念及文章类型。将检索词逐行写入 `artifacts.terms_file`。
 2. 选择扫描域：AI/LLM/Agent/RAG 用 `ai`；工具/效率/自动化用 `tools`；系统/配置/运维用 `system`；其他用 `all`。
 3. 执行 `KI scan --plan-file <artifacts.plan_file> --domain <domain> --terms-file <artifacts.terms_file> --output <artifacts.scan_file> --compact`。默认仅返回前 6 条、每条最多 350 字；完整候选仍保存到 scan 文件。主题可能重复而摘要不足时，再读取相关候选或扫描文件；`more_matches=true` 表示还有未保存的匹配，确需查全时提高 scan 的 limit。
-4. 主题语义重叠 ≥85% 才追加，否则新建；词命中率不是语义相似度。沿用合适的既有目录，优先候选提供的目录；需要新建时仅查看目标父目录的直接子目录，不列出整个 Vault、不读取完整日志/索引。KI 不能追加含 `aweme_id` 的 DY 作品笔记，可新建关联主题笔记。分类阈值保留笔记格式中的规则。
+4. 主题语义重叠 ≥85% 才追加，否则新建；词命中率不是语义相似度。沿用合适的既有目录，优先候选提供的目录；需要新建时仅查看目标父目录的直接子目录，不列出整个 Vault、不读取完整日志/索引。仅追加具有网页来源、标题、类型和日期的现有知识笔记；格式不匹配时新建关联主题笔记。分类阈值保留笔记格式中的规则。
 
 ## 3. 写入与结果
 
