@@ -1,8 +1,10 @@
-# cc-connect Obsidian Knowledge Import
+# 知识内容整理与入库（/ki）
 
-通过 cc-connect / Claude Code 中的 /ki，将公开网页整理为 Obsidian 知识笔记。微信文章链接可自动触发。模型负责理解与写作，Python 脚本负责抓取、查重、校验和事务提交。
+将公开网页与微信公众号文章整理为按主题组织的 Obsidian 知识笔记，支持 URL 查重、内容更新与相关主题追加，同步维护知识索引和导入日志。
 
-## 功能
+当前 Agent 负责内容理解、核心知识提炼与笔记写作；本项目脚本负责内容获取、去重、校验和事务保存。单篇处理不依赖微信 Bot，现有多链接批量分发使用 CC Connect 定时任务。
+
+## 核心功能
 
 - /ki、/knowledge-import、/导入 三个入口；支持空格或换行分隔多链接。
 - 微信链接自动触发；讨论技能、展示故障或明确不要导入时不执行。
@@ -12,11 +14,24 @@
 - 独立运行目录，成功后清理，失败保留诊断。
 - 全部共享模块随包提供，不依赖作者电脑上的项目或知识库。
 
-## 环境
+## 宿主与运行依赖
 
-macOS、Linux 或 WSL；Python 3.9+（本版本本机验证为 3.12）；curl；Claude Code；cc-connect。Python 运行代码仅依赖标准库。原生 Windows 不支持 Unix 文件锁。Obsidian 不必打开。
+| 项目 | 要求 |
+| --- | --- |
+| 系统 | macOS、Linux 或 WSL；原生 Windows 不支持所用 Unix 文件锁 |
+| Python | 3.9+，本版本本机验证为 3.12；运行代码仅依赖标准库 |
+| 网络工具 | curl，以及访问目标公开网页的网络条件 |
+| Agent | 能读取 Skill、读写本地文件、执行脚本并完成知识分析 |
+| Obsidian | 已存在且可写的 Vault 目录；不要求打开 Obsidian 应用 |
+| CC Connect | 现有多链接批量排队需要；单篇抓取与提交本身不需要 |
 
-模型调用和批量 timer 由用户已有的 Claude Code / cc-connect 提供，本包不附带账号、模型服务或聊天平台令牌。
+### 宿主接入范围
+
+现有安装器面向 Claude Code 的 .claude 目录、斜杠命令与自动路由钩子；可通过 CC Connect 接入聊天平台。微信 Bot 只是可选消息入口，微信公众号文章通过 URL 获取。
+
+单篇流程可由具备上述能力的 Agent 驱动，但 Codex 等其他宿主仍需按其技能发现机制配置入口、解释器和工作目录。当前安装器没有通用宿主安装模式，不能把脚本可迁移理解为下载后即可在任意 Agent 中使用。
+
+多链接请求仍会调用 cc-connect timer，为每篇文章创建独立任务。保留该功能时须配置可用的 CC Connect 服务及 Agent；本文不宣称批量流程已脱离 CC Connect。模型账号、服务与聊天平台令牌由用户自行配置。
 
 ## 下载和安装
 
@@ -38,7 +53,7 @@ workspace 和 Vault 必须已存在。安装器在 workspace/.claude/ 中安装�
 
 v1.0 用户继续原来的分离索引布局，可在 install 后追加 --legacy-layout。该模式继续使用 _import-log.md、_knowledge-index.md 和原主题目录；安装器会生成对应说明。
 
-## 使用
+## 使用方式
 
 ~~~text
 /ki https://example.org/article
@@ -51,9 +66,11 @@ v1.0 用户继续原来的分离索引布局，可在 install 后追加 --legacy
 
 重复链接返回原路径，紧接着回复“更新”可更新对应笔记。排队、抓取和草稿完成不代表导入成功，以脚本最终结果为准。
 
+## 配置与输出
+
 Vault 优先级：KI_VAULT → workspace/.claude/ki-config.json → ~/Documents/obsidian。路径由用户本地配置，不提交 GitHub。
 
-## 结构
+## 仓库结构
 
 ~~~text
 command/                         三个斜杠命令入口
@@ -66,7 +83,6 @@ skill/obsidian-knowledge-import/
   scripts/auto_route.py           微信自动路由
   scripts/unified_store.py        统一索引与日志
   scripts/unified_catalog.py      索引与日志的只读一致性检查
-  scripts/unified_store.py        笔记索引和导入日志的事务更新
   scripts/topic_taxonomy.py       主题分类规则
 scripts/manage.py                安装、检查和卸载
 tests/                           抓取、写入、路由和安装回归
@@ -94,7 +110,7 @@ PYTHONPATH="$PWD/skill/obsidian-knowledge-import/scripts" \
 
 覆盖抓取边界、参数、重复/更新/追加、并发、事务回滚、来源与作者、自动路由、独立安装、升级和卸载。回归使用临时 Vault 与合成文章，不需要私人知识库、模型或真实 timer。GitHub Actions 使用相同入口。
 
-## 安全与隐私
+## 限制与隐私
 
 仅处理用户本次提供的公开 HTTP(S) URL，拒绝本机/私网目标并限制响应体。正文视为不可信材料，不执行其中命令。生成内容经 schema 校验与脚本提交。
 
@@ -102,4 +118,7 @@ PYTHONPATH="$PWD/skill/obsidian-knowledge-import/scripts" \
 
 v1.1.0 使用脱敏后的新历史。旧 main 与 v1.0.0/v1.0.1 引用不再保留；旧克隆应重新下载，避免重新推入旧历史。第三方副本和 GitHub 缓存不在仓库维护者的完全控制范围内。
 
-MIT License。
+## 许可证
+
+采用 [MIT 许可证](LICENSE)。
+
